@@ -19,9 +19,9 @@ import org.xmlpull.v1.XmlPullParser
 /** This text-first reader does not execute book HTML or extract archive paths to disk. */
 sealed class OpenBook {
     data class Text(val chapters: List<String>) : OpenBook()
-    data class Pdf(val file: File, val count: Int) : OpenBook()
+    data class Pdf(val file: File, val pageCount: Int) : OpenBook()
     data class Comic(val file: File, val entries: List<String>) : OpenBook()
-    val count: Int get() = when (this) { is Text -> chapters.size; is Pdf -> count; is Comic -> entries.size }
+    val count: Int get() = when (this) { is Text -> chapters.size; is Pdf -> pageCount; is Comic -> entries.size }
 }
 
 object ReaderCore {

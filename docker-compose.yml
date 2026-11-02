@@ -4,10 +4,11 @@ services:
     image: ${READCORE_IMAGE:?Set READCORE_IMAGE in .env}
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${READCORE_PORT:-8080}:8080"
+      - "${READCORE_PORT:-3435}:3435"
     environment:
       READCORE_TOKEN: ${READCORE_TOKEN:?Set a strong READCORE_TOKEN in .env}
       READCORE_LIBRARY: /books
+      READCORE_LISTEN: ${READCORE_LISTEN:-0.0.0.0:3435}
       DATABASE_URL: sqlite:///data/readcore.db
     volumes:
       - readcore-data:/data

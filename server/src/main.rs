@@ -6,6 +6,7 @@ use axum::{
     routing::get, Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions}, Row, SqlitePool};
@@ -14,6 +15,10 @@ use subtle::ConstantTimeEq;
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
 use walkdir::WalkDir;
+
+#[derive(RustEmbed)]
+#[folder = "static/"]
+struct WebAssets;
 
 struct App { library: PathBuf, token_hash: [u8; 32], db: SqlitePool, cache: tokio::sync::Mutex<Option<(Instant, Vec<(Book, PathBuf)>)>> }
 #[derive(Clone, Serialize)]
@@ -184,6 +189,22 @@ async fn opds(State(state): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Re
     feed.push_str("</feed>");
     Ok(([(header::CONTENT_TYPE, HeaderValue::from_static("application/atom+xml;profile=opds-catalog;kind=acquisition;charset=utf-8"))], feed).into_response())
 }
+// Static files are public; book and progress endpoints retain their existing auth.
+fn embedded_asset(path: &str) -> Response {
+    let Some(asset) = WebAssets::get(path) else { return StatusCode::NOT_FOUND.into_response(); };
+    let content_type = match path.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "application/javascript; charset=utf-8",
+        _ => "application/octet-stream",
+    };
+    ([(header::CONTENT_TYPE, content_type), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")], asset.data.into_owned()).into_response()
+}
+async fn web_index() -> Response { embedded_asset("index.html") }
+async fn web_script() -> Response { embedded_asset("app.js") }
+async fn web_style() -> Response { embedded_asset("styles.css") }
+async fn web_vendor(Path(path): Path<String>) -> Response { embedded_asset(&format!("vendor/{path}")) }
+
 async fn challenge(response: Response) -> Response {
     let mut response = response;
     if response.status() == StatusCode::UNAUTHORIZED {
@@ -201,11 +222,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = SqlitePoolOptions::new().max_connections(5).connect_with(options).await?;
     sqlx::query(CREATE_PROGRESS).execute(&db).await?;
     let state = Arc::new(App { library, token_hash: Sha256::digest(token.as_bytes()).into(), db, cache: tokio::sync::Mutex::new(None) });
-    let app = Router::new().route("/api/books", get(books)).route("/api/books/:id/file", get(file))
+    let app = Router::new().route("/", get(web_index)).route("/app.js", get(web_script))
+        .route("/styles.css", get(web_style)).route("/vendor/*path", get(web_vendor))
+        .route("/api/books", get(books)).route("/api/books/:id/file", get(file))
         .route("/api/books/:id/cover", get(cover)).route("/api/progress/:id", get(get_progress).put(put_progress)).route("/opds", get(opds))
         .layer(axum::middleware::map_response(challenge)).layer(TraceLayer::new_for_http()).with_state(state);
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-    tracing::info!("ReadCore listening on port 8080");
+    let listen = env::var("READCORE_LISTEN").unwrap_or_else(|_| "0.0.0.0:3435".into());
+    let listener = tokio::net::TcpListener::bind(listen.as_str()).await?;
+    tracing::info!(address = %listen, "ReadCore listening");
     axum::serve(listener, app).await?;
     Ok(())
 }

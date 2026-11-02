@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>ReadCore</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/vendor/jszip.min.js" defer></script>
+  <script src="/vendor/epub.min.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">ReadCore</a>
+    <button id="sign-out" class="quiet" type="button" hidden>Change token</button>
+  </header>
+  <main>
+    <section id="login" class="login" aria-labelledby="login-title">
+      <p class="eyebrow">Your library, anywhere</p>
+      <h1 id="login-title">Welcome to ReadCore</h1>
+      <p>Enter your library token to continue. It stays in this browser.</p>
+      <form id="login-form">
+        <label for="token">Library token</label>
+        <input id="token" name="token" type="password" autocomplete="off" required>
+        <button type="submit">Open library</button>
+      </form>
+      <p id="login-error" class="error" role="alert"></p>
+    </section>
+
+    <section id="library" class="library" aria-labelledby="library-title" hidden>
+      <div class="section-header">
+        <div><p class="eyebrow">Your collection</p><h1 id="library-title">Library</h1></div>
+        <button id="refresh" class="quiet" type="button">Refresh</button>
+      </div>
+      <p id="library-status" class="status" role="status"></p>
+      <div id="books" class="book-grid"></div>
+    </section>
+
+    <section id="reader" class="reader" aria-labelledby="reader-title" hidden>
+      <div class="reader-header">
+        <button id="back" class="quiet" type="button">← Library</button>
+        <h1 id="reader-title"></h1>
+        <div class="reader-settings">
+          <label for="font-size">Text size</label>
+          <select id="font-size">
+            <option value="80">80%</option><option value="90">90%</option>
+            <option value="100" selected>100%</option><option value="110">110%</option>
+            <option value="125">125%</option><option value="150">150%</option>
+            <option value="175">175%</option><option value="200">200%</option>
+          </select>
+          <label for="theme">Theme</label>
+          <select id="theme">
+            <option value="black">Black</option><option value="sepia">Sepia</option><option value="light">Light</option>
+          </select>
+        </div>
+      </div>
+      <p id="reader-status" class="status" role="status"></p>
+      <div id="viewer" aria-label="Book contents"></div>
+      <nav class="reader-navigation" aria-label="Reading navigation">
+        <button id="previous" class="quiet" type="button">← Previous</button>
+        <span id="position" aria-live="polite"></span>
+        <button id="next" class="quiet" type="button">Next →</button>
+      </nav>
+    </section>
+  </main>
+</body>
+</html>

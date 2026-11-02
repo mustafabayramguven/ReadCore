@@ -1,0 +1,64 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #000;
+  color: #f2f1f5;
+  --surface: #15141a;
+  --muted: #b8b4c2;
+  --accent: #cbbdff;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; min-height: 100vh; background: #000; }
+button, input, select { font: inherit; }
+button, select { cursor: pointer; }
+button {
+  border: 0; border-radius: 999px; padding: .75rem 1.15rem;
+  color: #1d1535; background: var(--accent); font-weight: 650;
+}
+button:disabled { opacity: .5; cursor: wait; }
+button.quiet { color: #e9e1ff; background: #25212e; }
+button:hover:not(:disabled) { filter: brightness(1.15); }
+button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.topbar { display: flex; align-items: center; justify-content: space-between; max-width: 1400px; margin: auto; padding: 1rem 1.5rem; }
+.brand { color: inherit; text-decoration: none; font-size: 1.2rem; font-weight: 750; letter-spacing: -.04em; }
+main { max-width: 1400px; margin: auto; }
+h1 { margin: .15rem 0; letter-spacing: -.04em; }
+p { line-height: 1.5; }
+.eyebrow { margin: 0; color: var(--accent); font-size: .75rem; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+.login { max-width: 480px; padding: 12vh 1.5rem 3rem; margin: auto; }
+.login h1 { font-size: clamp(2rem, 7vw, 3rem); }
+.login p:not(.eyebrow) { color: var(--muted); }
+.login form { display: grid; gap: .7rem; margin-top: 2rem; }
+.login form button { justify-self: start; margin-top: .5rem; }
+label { color: var(--muted); font-size: .85rem; }
+input, select { color: #f3f1fa; background: var(--surface); border: 1px solid #494352; border-radius: .55rem; padding: .7rem; }
+.error { color: #ff9b9b !important; min-height: 1.5em; }
+.library { padding: 2rem 1.5rem 4rem; }
+.section-header { display: flex; align-items: end; justify-content: space-between; gap: 1rem; margin-bottom: 1.5rem; }
+.section-header h1 { font-size: clamp(2rem, 6vw, 3rem); }
+.status { color: var(--muted); min-height: 1.5em; }
+.book-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); gap: 1.5rem 1rem; }
+.book-card { min-width: 0; }
+.cover { display: flex; flex-direction: column; justify-content: flex-end; width: 100%; aspect-ratio: 2 / 3; border: 0; border-radius: .8rem; background: var(--surface); color: #f2f1f5; overflow: hidden; padding: 1rem; text-align: left; }
+.cover img { display: block; width: calc(100% + 2rem); height: calc(100% + 2rem); margin: -1rem; object-fit: cover; }
+.cover .format { color: var(--accent); font-size: .7rem; letter-spacing: .1em; text-transform: uppercase; }
+.cover .cover-title { margin-top: .7rem; overflow-wrap: anywhere; }
+.book-title { font-weight: 650; margin: .6rem 0 .2rem; overflow-wrap: anywhere; }
+.book-author { font-size: .85rem; color: var(--muted); margin: 0 0 .6rem; }
+.book-action { margin-top: .5rem; font-size: .85rem; }
+.reader { height: calc(100dvh - 4.6rem); min-height: 400px; display: flex; flex-direction: column; padding: 0 1rem 1rem; }
+.reader-header { display: flex; align-items: center; flex-wrap: wrap; gap: .8rem; }
+.reader-header h1 { flex: 1; font-size: 1rem; min-width: 8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reader-settings { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
+.reader-settings select { padding: .4rem; }
+.reader .status { margin: .4rem 0; font-size: .85rem; }
+#viewer { flex: 1; min-height: 0; overflow: hidden; background: #000; }
+.reader-navigation { display: flex; justify-content: space-between; align-items: center; gap: .5rem; padding-top: .5rem; }
+#position { color: var(--muted); font-size: .85rem; text-align: center; }
+@media (max-width: 600px) {
+  .reader { height: calc(100dvh - 4.6rem); padding: 0 .6rem .6rem; }
+  .reader-header h1 { order: 1; flex-basis: 100%; }
+  .reader-settings { margin-left: auto; }
+  .book-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+}

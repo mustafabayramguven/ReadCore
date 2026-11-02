@@ -1,8 +1,8 @@
 # ReadCore 0.1
 
-ReadCore is an initial self-hosted reading platform: an Axum/SQLite server and a Kotlin/Compose Android client. GitHub Actions builds the image and APK; neither an Android SDK nor Rust toolchain is required on your own computer.
+ReadCore is an initial self-hosted reading platform: an Axum/SQLite server with an embedded web reader and a Kotlin/Compose Android client. GitHub Actions builds the image and APK; neither an Android SDK nor Rust toolchain is required on your own computer.
 
-**This is an early scaffold, not a production-ready release.** The workflows and application have not yet been built or tested on GitHub or an Android device. See the limitations below before deploying.
+**This is an early scaffold, not a production-ready release.** The current changes still need validation in GitHub Actions and on a device. See the limitations below before deploying.
 
 ## Repository structure
 
@@ -18,7 +18,8 @@ ReadCore is an initial self-hosted reading platform: an Axum/SQLite server and a
 ├── server/
 │   ├── Cargo.toml
 │   ├── Dockerfile
-│   └── src/main.rs               # Authentication, OPDS, books and sync API
+│   ├── src/main.rs               # Authentication, OPDS, books and sync API
+│   └── static/                   # Embedded web reader source
 └── android/
     ├── build.gradle.kts
     ├── gradle.properties
@@ -50,9 +51,11 @@ On the machine that will host the server, install Docker and Docker Compose. Cop
 - `READCORE_IMAGE`: your actual GHCR image, for example `ghcr.io/alice/readcore-server:latest` for repository `alice/readcore`.
 - `READCORE_TOKEN`: a long, randomly generated secret, at least 16 bytes. This is the shared library credential.
 - `READCORE_BOOKS_DIR`: the absolute host directory containing your books. The container's non-root user (UID 10001) must be able to read it.
+- `READCORE_PORT`: host port, default `3435`.
+- `READCORE_LISTEN`: server listen address, default `0.0.0.0:3435`. If its port changes, update the Compose container mapping and Caddy target too.
 - `READCORE_DOMAIN`: the public DNS name, only if using the HTTPS overlay.
 
-Run `docker compose up -d` for the server alone. The HTTP port is bound to `127.0.0.1` on the host. The named `readcore-data` volume contains the SQLite database; stop the server before taking a volume backup, and back it up together with the original books. Book files are mounted read-only. Library changes can take up to 10 seconds to appear.
+Run `docker compose up -d` for the server alone. The HTTP port is published on all host interfaces at port `3435` by default. Open `http://<host>:3435/` in a browser to use the web reader. The token and book data travel unencrypted over HTTP, so use HTTPS for untrusted networks; restrict the direct port with a firewall when using the proxy. The named `readcore-data` volume contains the SQLite database; stop the server before taking a volume backup, and back it up together with the original books. Book files are mounted read-only. Library changes can take up to 10 seconds to appear.
 
 The Android client requires HTTPS and a certificate trusted by Android. To use the optional Caddy proxy, point the public domain at the server, allow inbound ports 80 and 443, and run:
 
@@ -60,19 +63,25 @@ The Android client requires HTTPS and a certificate trusted by Android. To use t
 docker compose -f docker-compose.yml -f docker-compose.https.yml up -d
 ```
 
-Caddy obtains and renews a public certificate. Alternatively, use an existing HTTPS reverse proxy or a trusted private HTTPS service and forward it to the host's `127.0.0.1:8080`. In the app, enter `https://<domain>` and the token under Settings, then connect. If publishing publicly, use a firewall, TLS, backups, and additional access controls appropriate to your environment.
+Caddy obtains and renews a public certificate. Alternatively, use an existing HTTPS reverse proxy or a trusted private HTTPS service and forward it to the host's `127.0.0.1:3435`. In the app, enter `https://<domain>` and the token under Settings, then connect. If publishing publicly, use a firewall, TLS, backups, and additional access controls appropriate to your environment.
 
 ## Library and API
 
 Place EPUB, PDF, MOBI, CBZ, or CBR files anywhere below the configured library directory. The server scans without following symlinks. File IDs derive from relative paths, so moving or renaming a book creates a new ID and loses its association with previous progress. For EPUBs, the catalog uses embedded title, author, and JPEG/PNG/WebP cover metadata when present; otherwise it uses the filename. No external metadata provider is queried.
 
-All endpoints require the token. The Android app uses `Authorization: Bearer <token>`. For an OPDS 1.x client, use `https://<domain>/opds` and HTTP Basic authentication with any username and the token as password. Acquisition links download the original files. Other endpoints are `GET /api/books`, `GET /api/books/{id}/file`, `GET /api/books/{id}/cover`, and `GET`/`PUT /api/progress/{id}`. A progress PUT accepts `{"chapter": 0, "offset": 0.0}`. There is one shared library identity, not individual accounts.
+The web page and its static assets are public; every API and OPDS endpoint still requires the token. The browser and Android app use `Authorization: Bearer <token>`. For an OPDS 1.x client, use `https://<domain>/opds` and HTTP Basic authentication with any username and the token as password. Acquisition links download the original files. Other endpoints are `GET /api/books`, `GET /api/books/{id}/file`, `GET /api/books/{id}/cover`, and `GET`/`PUT /api/progress/{id}`. A progress PUT accepts `{"chapter": 0, "offset": 0.0}`. There is one shared library identity, not individual accounts.
+
+## Web reader
+
+Open `http://<host>:3435/`, enter the library token, and select an EPUB. The token is stored in browser localStorage until **Change token** is selected. The browser fetches covers and books with the bearer token. EPUB reading supports text size, three themes, and chapter/within-chapter progress; PDF, CBZ, MOBI, and CBR are downloads. Page fractions are approximate and can shift when the viewport or font size changes. The Android reader may assign different chapter indices to EPUBs with non-text or empty spine entries.
+
+The Docker build downloads pinned epub.js and JSZip releases, then embeds them along with the web sources into the server binary. Browsers load them from the server, with no CDN request at runtime. As a result, a server compiled without the Docker download stage must provide those two files under `server/static/vendor/` to use the reader.
 
 ## Current scope and limitations
 
-- The EPUB reader displays text from the spine. It does not preserve full publisher formatting, CSS, embedded images, navigation landmarks, or fixed-layout pages. Imported EPUB covers are currently placeholders; server EPUBs can show embedded covers.
+- The Android EPUB reader displays text from the spine. It does not preserve full publisher formatting, CSS, embedded images, navigation landmarks, or fixed-layout pages. Imported EPUB covers are currently placeholders; server EPUBs can show embedded covers.
 - MOBI support is limited to unencrypted legacy MOBI/PalmDOC using uncompressed or PalmDOC-compressed text. DRM, HUFF/CDIC and KF8 are unsupported. PDFs use Android's renderer; CBZ supports common image pages. The server lists CBR, but the Android reader cannot open CBR yet.
 - Custom fonts, text size, line height, paragraph spacing and colors apply to text books. PDF and comic pages are rendered as images.
-- Progress is chapter/page-level, not the scroll position within a chapter. While the reader is in the foreground, it polls approximately every 30 seconds and pushes changes; the last successful write wins. Offline changes are queued locally and retried when reopening or while reading. There is no background sync or multi-user isolation.
+- Android progress is chapter/page-level, not the scroll position within a chapter; the web reader also stores an approximate fraction within the chapter. While the reader is in the foreground, it polls approximately every 30 seconds and pushes changes; the last successful write wins. Offline changes are queued locally and retried when reopening or while reading. There is no background sync or multi-user isolation.
 - Room records foreground reading time locally. Page/chapter and word counts are estimates recorded when moving forward, and stats do not sync between devices. Streaks count days with reading time. Back up app data separately if those statistics matter.
 - The server is a single-token service without user management, rate limiting, robust conflict resolution, or a built-in TLS termination layer. Treat it as an early prototype and do not assume security or interoperability has been audited.
