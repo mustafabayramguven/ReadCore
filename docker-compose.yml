@@ -1,0 +1,18 @@
+services:
+  readcore:
+    # Set READCORE_IMAGE to the GHCR image published by your repository.
+    image: ${READCORE_IMAGE:?Set READCORE_IMAGE in .env}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${READCORE_PORT:-8080}:8080"
+    environment:
+      READCORE_TOKEN: ${READCORE_TOKEN:?Set a strong READCORE_TOKEN in .env}
+      READCORE_LIBRARY: /books
+      DATABASE_URL: sqlite:///data/readcore.db
+    volumes:
+      - readcore-data:/data
+      - ${READCORE_BOOKS_DIR:?Set READCORE_BOOKS_DIR in .env}:/books:ro
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  readcore-data:

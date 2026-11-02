@@ -1,0 +1,25 @@
+[package]
+name = "readcore-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+axum = "0.7.9"
+base64 = "0.22.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hex = "0.4.3"
+percent-encoding = "2.3"
+roxmltree = "0.20"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10.8"
+sqlx = { version = "0.8.3", default-features = false, features = ["runtime-tokio", "sqlite"] }
+subtle = "2.6.1"
+tokio = { version = "1.43", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6.2", features = ["trace", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+walkdir = "2.5"

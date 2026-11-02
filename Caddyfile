@@ -1,0 +1,3 @@
+{$READCORE_DOMAIN} {
+    reverse_proxy readcore:8080
+}
