@@ -14,7 +14,9 @@ COPY --from=vendor /vendor/ ./static/vendor/
 RUN cargo test --release && cargo build --release
 
 FROM debian:bookworm-slim
-RUN groupadd --system --gid 10001 readcore \
+RUN apt-get update && apt-get install -y --no-install-recommends poppler-utils libarchive-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 readcore \
     && useradd --system --uid 10001 --gid 10001 --home-dir /data readcore \
     && mkdir -p /data /books && chown readcore:readcore /data
 COPY --from=build /src/target/release/readcore-server /usr/local/bin/readcore-server

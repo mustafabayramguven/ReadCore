@@ -12,7 +12,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
@@ -86,7 +88,8 @@ fun ReadCoreApp(model: ReadModel = viewModel()) {
         NavHost(navController = nav, startDestination = "library", modifier = Modifier.padding(padding)) {
             composable("library") { LibraryScreen(model) { book -> model.open(book) { nav.navigate("reader") } } }
             composable("stats") { StatsScreen(model) }
-            composable("settings") { SettingsScreen(model) }
+            composable("settings") { SettingsScreen(model) { nav.navigate("storage") } }
+            composable("storage") { StorageScreen(model) { nav.popBackStack() } }
             composable("reader") { ReaderScreen(model) { nav.popBackStack() } }
         }
     }
@@ -96,29 +99,88 @@ fun ReadCoreApp(model: ReadModel = viewModel()) {
 @Composable
 fun LibraryScreen(model: ReadModel, open: (LibraryBook) -> Unit) {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(model::importBook) }
+    var downloadedOnly by remember { mutableStateOf(false) }
+    val visible = if (downloadedOnly) model.library.filter { it.localPath != null } else model.library
+    val recent = visible.filter { it.lastReadAt > 0 }.sortedByDescending { it.lastReadAt }
     Scaffold(topBar = { TopAppBar(title = { Text("ReadCore") }, actions = {
         IconButton(onClick = model::refresh) { Icon(Icons.Default.Refresh, "Refresh server library") }
         IconButton(onClick = { picker.launch(arrayOf("*/*")) }) { Icon(Icons.Default.Add, "Import book") }
     }) }) { padding ->
-        if (model.loading) Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-        else if (model.library.isEmpty()) Box(Modifier.fillMaxSize().padding(padding).padding(24.dp), contentAlignment = Alignment.Center) {
-            Text("Import a book or connect your server in Settings, then refresh.", style = MaterialTheme.typography.bodyLarge)
-        } else LazyVerticalGrid(columns = GridCells.Adaptive(140.dp), contentPadding = PaddingValues(16.dp), modifier = Modifier.padding(padding), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            items(model.library, key = { it.id }) { book ->
-                var cover by remember(book.id) { mutableStateOf<android.graphics.Bitmap?>(null) }
-                LaunchedEffect(book.id, book.remote) { cover = model.loadCover(book) }
-                Column(Modifier.clickable { open(book) }) {
-                    Box(Modifier.fillMaxWidth().aspectRatio(.7f).background(MaterialTheme.colorScheme.surfaceContainer, RoundedCornerShape(12.dp)), contentAlignment = Alignment.BottomStart) {
-                        if (cover != null) Image(cover!!.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
-                        else Column(Modifier.padding(16.dp)) {
-                            Text(book.format.uppercase(), color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelSmall)
-                            Spacer(Modifier.height(8.dp))
-                            Text(book.title, maxLines = 5, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
+        if (model.loading && model.library.isEmpty()) Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+        else LazyVerticalGrid(columns = GridCells.Adaptive(140.dp), contentPadding = PaddingValues(16.dp), modifier = Modifier.padding(padding), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (recent.isNotEmpty()) {
+                        Text("Continue reading", style = MaterialTheme.typography.titleLarge)
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            items(recent, key = { it.id }) { book ->
+                                Column(Modifier.width(130.dp).clickable { open(book) }) {
+                                    BookCover(model, book, Modifier.fillMaxWidth().height(150.dp))
+                                    Text(book.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    LinearProgressIndicator(progress = { (book.percent / 100).toFloat().coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                                    Text("${book.percent.toInt()}%", style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
                         }
                     }
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Library", style = MaterialTheme.typography.titleLarge)
+                        FilterChip(selected = downloadedOnly, onClick = { downloadedOnly = !downloadedOnly }, label = { Text("Downloaded") })
+                    }
+                    if (visible.isEmpty()) Text(if (downloadedOnly) "No downloaded books yet." else "Import a book or connect your server in Settings, then refresh.")
+                }
+            }
+            items(visible, key = { it.id }) { book ->
+                Column {
+                    BookCover(model, book, Modifier.fillMaxWidth().aspectRatio(.7f).clickable { open(book) })
                     Spacer(Modifier.height(6.dp))
                     Text(book.title, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelLarge)
                     if (book.author.isNotBlank()) Text(book.author, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                    when {
+                        book.localPath != null -> {
+                            Text("Available offline", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                            TextButton(onClick = { model.removeDownload(book) }) { Text("Remove download") }
+                        }
+                        book.downloadState == "queued" || book.downloadState == "downloading" -> {
+                            val fraction = if (book.size > 0) (book.downloadedBytes.toFloat() / book.size).coerceIn(0f, 1f) else 0f
+                            LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth())
+                            Text("${book.downloadedBytes / 1024} KB downloaded", style = MaterialTheme.typography.bodySmall)
+                        }
+                        book.remote -> TextButton(onClick = { model.download(book) }) { Text("Download for offline") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun BookCover(model: ReadModel, book: LibraryBook, modifier: Modifier = Modifier) {
+    var cover by remember(book.id, book.coverPath) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    LaunchedEffect(book.id, book.coverPath) { cover = model.loadCover(book) }
+    Box(modifier.background(MaterialTheme.colorScheme.surfaceContainer, RoundedCornerShape(12.dp)), contentAlignment = Alignment.BottomStart) {
+        if (cover != null) Image(cover!!.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+        else Column(Modifier.padding(16.dp)) {
+            Text(book.format.uppercase(), color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelSmall)
+            Spacer(Modifier.height(8.dp))
+            Text(book.title, maxLines = 5, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun StorageScreen(model: ReadModel, back: () -> Unit) {
+    val downloaded = model.library.filter { it.localPath != null }
+    val bytes = model.library.sumOf { (if (it.localPath != null) File(it.localPath).length() else it.downloadedBytes) + (it.coverPath?.let { path -> File(path).length() } ?: 0L) }
+    Scaffold(topBar = { TopAppBar(title = { Text("Storage") }, navigationIcon = { IconButton(onClick = back) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } }) }) { padding ->
+        LazyColumn(Modifier.padding(padding), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item { Text("${bytes / (1024 * 1024)} MB used by books and covers", style = MaterialTheme.typography.titleLarge) }
+            if (downloaded.isEmpty()) item { Text("No downloaded books.") }
+            items(downloaded, key = { it.id }) { book ->
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) { Text(book.title); Text("${File(book.localPath!!).length() / 1024} KB", style = MaterialTheme.typography.bodySmall) }
+                    TextButton(onClick = { model.removeDownload(book) }) { Text("Remove") }
                 }
             }
         }
@@ -162,9 +224,10 @@ fun StatsScreen(model: ReadModel) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(model: ReadModel) {
+fun SettingsScreen(model: ReadModel, openStorage: () -> Unit) {
     var url by remember { mutableStateOf(model.url) }
     var token by remember { mutableStateOf(model.token) }
+    var userId by remember { mutableStateOf(model.userId) }
     var background by remember { mutableStateOf(model.background) }
     var foreground by remember { mutableStateOf(model.textColor) }
     val fontPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let(model::importFont) }
@@ -173,7 +236,10 @@ fun SettingsScreen(model: ReadModel) {
             Text("Server", style = MaterialTheme.typography.titleLarge)
             OutlinedTextField(url, { url = it }, label = { Text("HTTPS server URL") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             OutlinedTextField(token, { token = it }, label = { Text("Server token") }, visualTransformation = PasswordVisualTransformation(), singleLine = true, modifier = Modifier.fillMaxWidth())
-            Button(onClick = { model.saveServer(url, token); model.refresh() }) { Text("Save and connect") }
+            OutlinedTextField(userId, { userId = it }, label = { Text("User ID") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            Button(onClick = { model.saveUser(userId); model.saveServer(url, token); model.refresh() }) { Text("Save and connect") }
+            OutlinedButton(onClick = model::downloadAll) { Text("Download all for offline") }
+            TextButton(onClick = openStorage) { Text("Storage usage") }
             HorizontalDivider(Modifier.padding(vertical = 8.dp))
             Text("Reader", style = MaterialTheme.typography.titleLarge)
             Text("Font size: ${model.fontSize} sp")
@@ -202,6 +268,12 @@ fun SettingsScreen(model: ReadModel) {
 fun ReaderScreen(model: ReadModel, back: () -> Unit) {
     val book = model.current ?: return
     val content = model.opened ?: return
+    model.remoteOffer?.let { offer ->
+        AlertDialog(onDismissRequest = { model.resolveRemote(false) }, title = { Text("Continue reading?") },
+            text = { Text("Continue from page ${offer.label} on ${offer.progress.deviceId}?") },
+            confirmButton = { TextButton(onClick = { model.resolveRemote(true) }) { Text("Continue") } },
+            dismissButton = { TextButton(onClick = { model.resolveRemote(false) }) { Text("Stay here") } })
+    }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     var resumed by remember { mutableStateOf(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) }
     var started by remember { mutableLongStateOf(if (resumed) SystemClock.elapsedRealtime() else 0L) }
@@ -215,12 +287,12 @@ fun ReaderScreen(model: ReadModel, back: () -> Unit) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_RESUME -> { resumed = true; started = SystemClock.elapsedRealtime() }
-                Lifecycle.Event.ON_PAUSE -> { flushTime(); resumed = false; started = 0L }
+                Lifecycle.Event.ON_PAUSE -> { flushTime(); model.flushSync(); resumed = false; started = 0L }
                 else -> Unit
             }
         }
         lifecycle.addObserver(observer)
-        onDispose { flushTime(); lifecycle.removeObserver(observer) }
+        onDispose { flushTime(); model.flushSync(); lifecycle.removeObserver(observer) }
     }
     LaunchedEffect(book.id, resumed) {
         if (resumed) while (true) { delay(30_000); flushTime(); if (book.remote) model.syncProgress() }

@@ -16,13 +16,15 @@ use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
 use walkdir::WalkDir;
 
+mod v1;
+
 #[derive(RustEmbed)]
 #[folder = "static/"]
 struct WebAssets;
 
 struct App { library: PathBuf, token_hash: [u8; 32], db: SqlitePool, cache: tokio::sync::Mutex<Option<(Instant, Vec<(Book, PathBuf)>)>> }
 #[derive(Clone, Serialize)]
-struct Book { id: String, title: String, author: Option<String>, format: String, size: u64 }
+struct Book { id: String, title: String, author: Option<String>, series: Option<String>, language: Option<String>, format: String, size: u64 }
 #[derive(Serialize, Deserialize)]
 struct Progress { chapter: i64, offset: f64 }
 
@@ -68,14 +70,6 @@ fn epub_package(zip: &mut zip::ZipArchive<std::fs::File>) -> Option<(String, Str
     let package = String::from_utf8(zip_entry(zip, &path, 4 * 1024 * 1024)?).ok()?;
     Some((path, package))
 }
-fn epub_metadata(path: &FsPath) -> Option<(Option<String>, Option<String>)> {
-    let mut zip = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
-    let (_, package) = epub_package(&mut zip)?;
-    let doc = roxmltree::Document::parse(&package).ok()?;
-    let metadata = doc.descendants().find(|n| n.tag_name().name() == "metadata")?;
-    let text = |name: &str| metadata.descendants().find(|n| n.tag_name().name() == name).and_then(|n| n.text()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
-    Some((text("title"), text("creator")))
-}
 fn epub_cover(path: &FsPath) -> Option<(Vec<u8>, &'static str)> {
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
     let (package_path, package) = epub_package(&mut zip)?;
@@ -107,8 +101,15 @@ fn scan(library: &FsPath) -> Vec<(Book, PathBuf)> {
         let Ok(metadata) = entry.metadata() else { continue; };
         // IDs stay stable while a relative path is unchanged.
         let id = hex::encode(Sha256::digest(relative.to_string_lossy().as_bytes()));
-        let (title, author) = if format == "epub" { epub_metadata(path).unwrap_or((None, None)) } else { (None, None) };
-        books.push((Book { id, title: title.unwrap_or_else(|| name.to_string()), author, format: format.to_string(), size: metadata.len() }, path.to_path_buf()));
+        let extracted = match format {
+            "epub" => v1::epub_details(path),
+            "cbz" => v1::comic_details(path),
+            "cbr" => v1::rar_details(path),
+            "pdf" => v1::pdf_details(path),
+            _ => v1::Metadata::default(),
+        };
+        let fallback_author = relative.parent().and_then(|p| p.file_name()).and_then(|p| p.to_str()).filter(|s| !s.is_empty()).map(str::to_owned);
+        books.push((Book { id, title: extracted.title.unwrap_or_else(|| name.to_string()), author: extracted.author.or(fallback_author).or_else(|| Some("Unknown Author".to_owned())), series: extracted.series, language: extracted.language, format: format.to_string(), size: metadata.len() }, path.to_path_buf()));
     }
     books.sort_by(|a, b| a.0.title.to_lowercase().cmp(&b.0.title.to_lowercase()));
     books
@@ -221,8 +222,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = SqliteConnectOptions::from_str(&env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:///data/readcore.db".into()))?.create_if_missing(true).journal_mode(SqliteJournalMode::Wal).busy_timeout(Duration::from_secs(5));
     let db = SqlitePoolOptions::new().max_connections(5).connect_with(options).await?;
     sqlx::query(CREATE_PROGRESS).execute(&db).await?;
+    v1::migrate(&db).await?;
     let state = Arc::new(App { library, token_hash: Sha256::digest(token.as_bytes()).into(), db, cache: tokio::sync::Mutex::new(None) });
-    let app = Router::new().route("/", get(web_index)).route("/app.js", get(web_script))
+    let _watcher = match v1::watch_library(state.clone()) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => { tracing::warn!(%error, "file watcher unavailable; periodic scans remain enabled"); None }
+    };
+    let app = Router::new().merge(v1::router()).route("/", get(web_index)).route("/app.js", get(web_script))
         .route("/styles.css", get(web_style)).route("/vendor/*path", get(web_vendor))
         .route("/api/books", get(books)).route("/api/books/:id/file", get(file))
         .route("/api/books/:id/cover", get(cover)).route("/api/progress/:id", get(get_progress).put(put_progress)).route("/opds", get(opds))

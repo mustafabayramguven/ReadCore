@@ -18,7 +18,7 @@ import org.xmlpull.v1.XmlPullParser
 
 /** This text-first reader does not execute book HTML or extract archive paths to disk. */
 sealed class OpenBook {
-    data class Text(val chapters: List<String>) : OpenBook()
+    data class Text(val chapters: List<String>, val spineIndices: List<Int> = chapters.indices.toList()) : OpenBook()
     data class Pdf(val file: File, val pageCount: Int) : OpenBook()
     data class Comic(val file: File, val entries: List<String>) : OpenBook()
     val count: Int get() = when (this) { is Text -> chapters.size; is Pdf -> pageCount; is Comic -> entries.size }
@@ -82,14 +82,16 @@ object ReaderCore {
             }
         }
         var total = 0
-        val chapters = spine.mapNotNull { manifest[it] }.map { path ->
+        val chapters = spine.mapIndexedNotNull { index, id ->
+            val path = manifest[id] ?: return@mapIndexedNotNull null
             val bytes = entry(zip, path)
             total += bytes.size
             require(total <= MAX_TEXT) { "EPUB text is too large" }
-            Html.fromHtml(bytes.toString(Charsets.UTF_8), Html.FROM_HTML_MODE_LEGACY).toString().trim()
-        }.filter { it.isNotBlank() }
+            val text = Html.fromHtml(bytes.toString(Charsets.UTF_8), Html.FROM_HTML_MODE_LEGACY).toString().trim()
+            if (text.isBlank()) null else index to text
+        }
         require(chapters.isNotEmpty()) { "EPUB contains no readable text" }
-        OpenBook.Text(chapters)
+        OpenBook.Text(chapters.map { it.second }, chapters.map { it.first })
     }
 
     /** Supports unencrypted MOBI 6 / PalmDOC text records, including PalmDOC compression. */

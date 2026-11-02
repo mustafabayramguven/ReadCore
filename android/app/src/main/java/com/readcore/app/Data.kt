@@ -5,8 +5,6 @@ import android.content.Context
 import android.graphics.Typeface
 import android.net.Uri
 import android.provider.OpenableColumns
-import android.util.Xml
-import org.xmlpull.v1.XmlPullParser
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -19,21 +17,18 @@ import androidx.room.Entity
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
-import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Transaction
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -57,17 +52,17 @@ abstract class ReadingDao {
     @Query("SELECT bookId, SUM(seconds) AS seconds FROM ReadingDay GROUP BY bookId")
     abstract fun books(): Flow<List<BookTotal>>
 }
-@Database(entities = [ReadingDay::class], version = 1, exportSchema = false)
-abstract class ReadDatabase : RoomDatabase() { abstract fun reading(): ReadingDao }
+@Database(entities = [ReadingDay::class, CachedBook::class, LocalProgress::class], version = 2, exportSchema = false)
+abstract class ReadDatabase : RoomDatabase() { abstract fun reading(): ReadingDao; abstract fun offline(): OfflineDao }
 
-data class LibraryBook(val id: String, val title: String, val format: String, val localPath: String? = null, val remote: Boolean = false, val author: String = "")
+data class LibraryBook(val id: String, val title: String, val format: String, val localPath: String? = null, val remote: Boolean = false, val author: String = "", val size: Long = 0, val coverPath: String? = null, val downloadState: String = "none", val downloadedBytes: Long = 0, val lastReadAt: Long = 0, val percent: Double = 0.0)
+data class RemoteOffer(val progress: LocalProgress, val label: String)
 
 class ReadModel(app: Application) : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("readcore", Context.MODE_PRIVATE)
     private val secrets = EncryptedSharedPreferences.create(app, "readcore-secrets", MasterKey.Builder(app).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(), EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV, EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM)
     private val client = OkHttpClient()
-    private val progressMutex = Mutex()
-    private val db = Room.databaseBuilder(app, ReadDatabase::class.java, "reading.db").build()
+    private val db = OfflineStore.db(app)
     val days = db.reading().days()
     val bookTotals = db.reading().books()
     var library by mutableStateOf(readLocal()); private set
@@ -84,6 +79,38 @@ class ReadModel(app: Application) : AndroidViewModel(app) {
     var current by mutableStateOf<LibraryBook?>(null); private set
     var opened by mutableStateOf<OpenBook?>(null); private set
     var chapter by mutableIntStateOf(0); private set
+    var userId by mutableStateOf(OfflineStore.user(app)); private set
+    var remoteOffer by mutableStateOf<RemoteOffer?>(null); private set
+    private var libraryObserver: Job? = null
+
+    init {
+        observeLibrary()
+        viewModelScope.launch {
+            for (book in readLocal()) {
+                val path = book.localPath ?: continue
+                val size = File(path).length()
+                db.offline().insertBook(CachedBook(book.id, book.title, book.author, book.format, size, book.remote, path, null, "ready", size, null))
+                if (prefs.contains("chapter_${book.id}")) {
+                    db.offline().insertProgress(LocalProgress(userId, book.id, "legacy:${prefs.getInt("chapter_${book.id}", 0)}", 0.0, "", 0, false))
+                }
+            }
+            OfflineStore.scheduleSync(app)
+        }
+    }
+    private fun observeLibrary() {
+        libraryObserver?.cancel()
+        val activeUser = userId
+        libraryObserver = viewModelScope.launch {
+            db.offline().observeBooks(activeUser).collect { rows ->
+                library = rows.map { row -> row.book.let { b -> LibraryBook(b.id, b.title, b.format, b.localPath?.takeIf { File(it).isFile }, b.remote, b.author, b.size, b.coverPath, b.downloadState, b.downloadedBytes, row.lastReadAt, row.percent) } }
+            }
+        }
+    }
+    fun saveUser(value: String) {
+        val next = value.trim()
+        if (next.isEmpty() || next.length > 128) { message = "Enter a user ID of up to 128 characters"; return }
+        userId = next; prefs.edit().putString("userId", next).apply(); observeLibrary()
+    }
 
     fun saveServer(newUrl: String, newToken: String) {
         url = newUrl.trim().trimEnd('/'); token = newToken.trim()
@@ -98,11 +125,13 @@ class ReadModel(app: Application) : AndroidViewModel(app) {
             val o = arr.getJSONObject(i); LibraryBook(o.getString("id"), o.getString("title"), o.getString("format"), o.getString("path"), o.optBoolean("remote"), o.optString("author"))
         }.filter { it.localPath != null && File(it.localPath).isFile }
     } catch (_: Exception) { emptyList() }
-    private fun saveLocal(book: LibraryBook) {
+    private suspend fun saveLocal(book: LibraryBook) {
         val list = (readLocal().filterNot { it.id == book.id } + book)
         val arr = JSONArray(); list.forEach { arr.put(JSONObject().put("id", it.id).put("title", it.title).put("format", it.format).put("path", it.localPath).put("remote", it.remote).put("author", it.author)) }
         prefs.edit().putString("books", arr.toString()).apply()
-        library = library.filterNot { it.id == book.id } + book
+        val path = book.localPath
+        db.offline().mergeBook(CachedBook(book.id, book.title, book.author, book.format, path?.let { File(it).length() } ?: 0, book.remote, path, book.coverPath, if (path != null) "ready" else "none", path?.let { File(it).length() } ?: 0, null))
+        if (path != null) db.offline().setDownload(book.id, path, "ready", File(path).length(), null)
     }
     private fun request(path: String): Request.Builder {
         require(url.startsWith("https://")) { "Use an HTTPS server URL" }
@@ -112,69 +141,60 @@ class ReadModel(app: Application) : AndroidViewModel(app) {
     fun refresh() { viewModelScope.launch {
         loading = true
         try {
+            val activeUser = userId
             val remote = withContext(Dispatchers.IO) {
-                client.newCall(request("/opds").build()).execute().use { response ->
+                val endpoint = "/api/v1/books?sort=recent&user_id=${Uri.encode(activeUser)}"
+                client.newCall(request(endpoint).build()).execute().use { response ->
                     check(response.isSuccessful) { "Server returned ${response.code}" }
-                    parseCatalog(response.body?.byteStream() ?: error("Empty catalog"))
-                }
-            }
-            val local = readLocal(); library = remote.map { r -> r.copy(localPath = local.find { it.id == r.id }?.localPath) } + local.filter { b -> remote.none { it.id == b.id } }
-        } catch (e: Exception) { message = e.message ?: "Unable to load library" } finally { loading = false }
-    } }
-    // ReadCore's acquisition feed uses stable IDs in its relative book links.
-    // Arbitrary external acquisition URLs are deliberately not followed.
-    private fun parseCatalog(input: java.io.InputStream): List<LibraryBook> {
-        val xml = Xml.newPullParser().apply { setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, true); setInput(input, "UTF-8") }
-        val books = mutableListOf<LibraryBook>()
-        var inEntry = false
-        var title = ""
-        var author = ""
-        var id: String? = null
-        var format: String? = null
-        while (xml.next() != XmlPullParser.END_DOCUMENT) {
-            when {
-                xml.eventType == XmlPullParser.START_TAG && xml.name == "entry" -> { inEntry = true; title = ""; author = ""; id = null; format = null }
-                inEntry && xml.eventType == XmlPullParser.START_TAG && xml.name == "title" -> title = xml.nextText()
-                inEntry && xml.eventType == XmlPullParser.START_TAG && xml.name == "name" -> author = xml.nextText()
-                inEntry && xml.eventType == XmlPullParser.START_TAG && xml.name == "link" && xml.getAttributeValue(null, "rel") == "http://opds-spec.org/acquisition" -> {
-                    val href = xml.getAttributeValue(null, "href") ?: ""
-                    id = Regex("^/api/books/([a-f0-9]{64})/file$").matchEntire(href)?.groupValues?.get(1)
-                    format = when (xml.getAttributeValue(null, "type")) {
-                        "application/epub+zip" -> "epub"
-                        "application/pdf" -> "pdf"
-                        "application/x-mobipocket-ebook" -> "mobi"
-                        "application/vnd.comicbook+zip" -> "cbz"
-                        "application/vnd.comicbook-rar" -> "cbr"
-                        else -> null
+                    val json = JSONArray(response.body?.string() ?: "[]")
+                    (0 until json.length()).map { index ->
+                        val o = json.getJSONObject(index)
+                        val book = CachedBook(o.getString("id"), o.getString("title"), o.optString("author", "").takeUnless { it == "null" } ?: "", o.getString("format"), o.optLong("size"), true, null, null, "none", 0, null,
+                            series = o.optString("series").takeUnless { it.isBlank() || it == "null" }, language = o.optString("language").takeUnless { it.isBlank() || it == "null" })
+                        val item = o.optJSONObject("progress")
+                        val progress = item?.let { LocalProgress(activeUser, book.id, it.getString("position"), it.getDouble("percent"), it.getString("device_id"), it.getLong("updated_at"), false) }
+                        book to progress
                     }
                 }
-                xml.eventType == XmlPullParser.END_TAG && xml.name == "entry" -> {
-                    if (id != null && format != null) books.add(LibraryBook(id, title.ifBlank { "Untitled" }, format, remote = true, author = author))
-                    inEntry = false
+            }
+            for ((book, candidate) in remote) {
+                db.offline().mergeBook(book)
+                if (candidate != null) {
+                    val local = db.offline().progress(activeUser, book.id)
+                    if (candidate.updatedAt > maxOf(local?.updatedAt ?: 0, local?.remoteUpdatedAt ?: 0)) {
+                        if (local == null) db.offline().insertProgress(LocalProgress(activeUser, book.id, "", 0.0, "", 0, false, candidate.position, candidate.percent, candidate.deviceId, candidate.updatedAt))
+                        else db.offline().storeRemoteCandidate(activeUser, book.id, local.updatedAt, candidate.position, candidate.percent, candidate.deviceId, candidate.updatedAt)
+                    }
                 }
             }
-        }
-        return books
-    }
-    suspend fun loadCover(book: LibraryBook): android.graphics.Bitmap? {
-        if (!book.remote || book.format != "epub") return null
-        return withContext(Dispatchers.IO) {
-            try {
-                client.newCall(request("/api/books/${book.id}/cover").build()).execute().use { response ->
-                    if (!response.isSuccessful) return@use null
-                    val input = response.body?.byteStream() ?: return@use null
-                    val out = java.io.ByteArrayOutputStream(); val buffer = ByteArray(8192)
-                    while (true) { val n = input.read(buffer); if (n < 0) break; if (out.size() + n > 8 * 1024 * 1024) return@use null; out.write(buffer, 0, n) }
-                    val bytes = out.toByteArray()
-                    val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                    android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-                    if (bounds.outWidth !in 1..20000 || bounds.outHeight !in 1..20000) return@use null
-                    var sample = 1
-                    while (bounds.outWidth / sample > 600 || bounds.outHeight / sample > 900) sample *= 2
-                    android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, android.graphics.BitmapFactory.Options().apply { inSampleSize = sample })
-                }
-            } catch (_: Exception) { null }
-        }
+            if (remote.isEmpty()) db.offline().removeAllUndownloaded() else db.offline().removeMissing(remote.map { it.first.id })
+            OfflineStore.scheduleSync(getApplication())
+        } catch (e: Exception) { message = e.message ?: "Unable to load library" } finally { loading = false }
+    } }
+    suspend fun loadCover(book: LibraryBook): android.graphics.Bitmap? = withContext(Dispatchers.IO) {
+        try {
+            val cached = db.offline().book(book.id)?.coverPath?.let(::File)?.takeIf { it.isFile }
+            val file = cached ?: if (book.remote) {
+                val dir = File(getApplication<Application>().filesDir, "covers").apply { mkdirs() }
+                val temp = File.createTempFile("cover", ".tmp", dir)
+                try {
+                    client.newCall(request("/api/v1/books/${book.id}/cover").build()).execute().use { response ->
+                        if (!response.isSuccessful) { temp.delete(); return@withContext null }
+                        copyLimited(response.body?.byteStream() ?: error("Empty cover"), temp, 8L * 1024 * 1024)
+                    }
+                    val destination = File(dir, "${book.id}.jpg")
+                    check(temp.renameTo(destination)) { "Could not save cover" }
+                    db.offline().setCover(book.id, destination.absolutePath)
+                    destination
+                } catch (e: Exception) { temp.delete(); throw e }
+            } else return@withContext null
+            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            android.graphics.BitmapFactory.decodeFile(file.absolutePath, bounds)
+            if (bounds.outWidth !in 1..20000 || bounds.outHeight !in 1..20000) return@withContext null
+            var sample = 1
+            while (bounds.outWidth / sample > 600 || bounds.outHeight / sample > 900) sample *= 2
+            android.graphics.BitmapFactory.decodeFile(file.absolutePath, android.graphics.BitmapFactory.Options().apply { inSampleSize = sample })
+        } catch (_: Exception) { null }
     }
     private fun copyLimited(input: java.io.InputStream, target: File, limit: Long) {
         try {
@@ -219,73 +239,110 @@ class ReadModel(app: Application) : AndroidViewModel(app) {
         } catch (e: Exception) { message = e.message ?: "Font import failed" }
     } }
     fun resetFont() { fontPath = ""; prefs.edit().remove("fontPath").apply() }
+    fun download(book: LibraryBook) {
+        if (!book.remote) return
+        viewModelScope.launch {
+            val stored = db.offline().book(book.id) ?: return@launch
+            if (stored.localPath != null && File(stored.localPath).isFile) return@launch
+            db.offline().setDownload(book.id, stored.localPath, "queued", stored.downloadedBytes, stored.etag)
+            OfflineStore.download(getApplication(), book.id)
+        }
+    }
+    fun downloadAll() { library.filter { it.remote && it.localPath == null }.forEach(::download) }
+    fun removeDownload(book: LibraryBook) { viewModelScope.launch {
+        androidx.work.WorkManager.getInstance(getApplication()).cancelUniqueWork("readcore-download-${book.id}")
+        withContext(Dispatchers.IO) {
+            book.localPath?.let { File(it).delete() }
+            File(getApplication<Application>().filesDir, "books/${book.id}.part").delete()
+        }
+        db.offline().setDownload(book.id, null, "none", 0, null)
+        if (!book.remote) db.offline().deleteImported(book.id)
+    } }
+    fun flushSync() { OfflineStore.scheduleSync(getApplication()) }
+    private fun position(content: OpenBook, format: String, page: Int): String = when {
+        format == "epub" && content is OpenBook.Text -> "epubcfi(/6/${(content.spineIndices[page] + 1) * 2}!/4)"
+        else -> "$format:$page"
+    }
+    private fun pageOf(content: OpenBook, format: String, position: String): Int {
+        val cfi = Regex("^epubcfi\\(/6/(\\d+)(?:\\[[^]]*])?!.*\\)$").matchEntire(position)
+        if (format == "epub" && content is OpenBook.Text && cfi != null) {
+            val spine = (cfi.groupValues[1].toIntOrNull() ?: 2) / 2 - 1
+            return content.spineIndices.indexOf(spine).coerceAtLeast(0)
+        }
+        return position.substringAfterLast(':').toIntOrNull() ?: 0
+    }
     fun open(book: LibraryBook, onOpened: () -> Unit) { viewModelScope.launch {
+        if (book.localPath == null) { download(book); message = "Downloading ${book.title}; open it when the download finishes"; return@launch }
         loading = true
         try {
-            var selected = book
-            if (selected.localPath == null) {
-                val downloaded = withContext(Dispatchers.IO) {
-                    val dir = File(getApplication<Application>().filesDir, "books").apply { mkdirs() }
-                    val temp = File.createTempFile("download", ".tmp", dir)
-                    try {
-                        client.newCall(request("/api/books/${book.id}/file").build()).execute().use { response ->
-                            check(response.isSuccessful) { "Server returned ${response.code}" }
-                            copyLimited(response.body?.byteStream() ?: error("Empty download"), temp, 512L * 1024 * 1024)
-                        }
-                        val dest = File(dir, "${book.id}.${book.format}"); check(temp.renameTo(dest)) { "Could not save download" }; dest
-                    } catch (e: Exception) { temp.delete(); throw e }
-                }
-                selected = book.copy(localPath = downloaded.absolutePath); saveLocal(selected)
-            }
-            val parsed = withContext(Dispatchers.IO) { ReaderCore.open(File(selected.localPath!!), selected.format) }
+            val parsed = withContext(Dispatchers.IO) { ReaderCore.open(File(book.localPath), book.format) }
             require(parsed.count > 0) { "Book has no pages" }
-            current = selected; opened = parsed
-            chapter = prefs.getInt("chapter_${selected.id}", 0).coerceIn(0, parsed.count - 1)
-            if (selected.remote) syncProgress()
+            val local = db.offline().progress(userId, book.id)
+            current = book; opened = parsed
+            chapter = (local?.let { pageOf(parsed, book.format, it.position) } ?: prefs.getInt("chapter_${book.id}", 0)).coerceIn(0, parsed.count - 1)
+            if (book.remote && prefs.getBoolean("pending_${book.id}", false) && (local == null || local.position.startsWith("legacy:"))) {
+                val percent = if (parsed.count <= 1) 0.0 else chapter * 100.0 / (parsed.count - 1)
+                db.offline().saveTurn(userId, book.id, position(parsed, book.format, chapter), percent, OfflineStore.device(getApplication()), true)
+                prefs.edit().putBoolean("pending_${book.id}", false).apply()
+                OfflineStore.scheduleSync(getApplication(), 2)
+            }
+            remoteOffer = null
+            if (local?.remoteUpdatedAt != null && local.remotePosition != null && local.remotePercent != null && local.remoteDevice != null && local.remoteUpdatedAt > local.updatedAt) {
+                val candidate = LocalProgress(userId, book.id, local.remotePosition, local.remotePercent, local.remoteDevice, local.remoteUpdatedAt, false)
+                remoteOffer = RemoteOffer(candidate, "${pageOf(parsed, book.format, candidate.position) + 1}")
+            }
             onOpened()
+            if (book.remote) viewModelScope.launch { checkRemote(book, parsed) }
         } catch (e: Exception) { message = e.message ?: "Cannot open book" } finally { loading = false }
+    } }
+    private suspend fun checkRemote(book: LibraryBook, content: OpenBook) {
+        val activeUser = userId
+        try {
+            val candidate = withContext(Dispatchers.IO) {
+                client.newCall(request("/api/v1/sync/${Uri.encode(activeUser)}/${book.id}").build()).execute().use { response ->
+                    if (response.code == 404) return@use null
+                    check(response.isSuccessful) { "Sync unavailable" }
+                    val json = JSONObject(response.body?.string() ?: return@use null)
+                    LocalProgress(activeUser, book.id, json.getString("position"), json.getDouble("percent"), json.getString("device_id"), json.getLong("updated_at"), false)
+                }
+            } ?: return
+            val local = db.offline().progress(activeUser, book.id)
+            if (candidate.updatedAt > (local?.updatedAt ?: 0L) && current?.id == book.id && userId == activeUser) {
+                remoteOffer = RemoteOffer(candidate, "${pageOf(content, book.format, candidate.position) + 1}")
+            }
+        } catch (_: Exception) { /* Offline reading remains available. */ }
+    }
+    fun resolveRemote(accept: Boolean) { viewModelScope.launch {
+        val offer = remoteOffer ?: return@launch
+        val book = current ?: return@launch
+        val content = opened ?: return@launch
+        if (accept && offer.progress.bookId == book.id && offer.progress.userId == userId && db.offline().acceptRemote(offer.progress)) {
+            chapter = pageOf(content, book.format, offer.progress.position).coerceIn(0, content.count - 1)
+            prefs.edit().putInt("chapter_${book.id}", chapter).apply()
+        } else db.offline().clearCandidate(offer.progress.userId, offer.progress.bookId)
+        remoteOffer = null
     } }
     fun changeChapter(value: Int) {
         val book = current ?: return; val content = opened ?: return
         val next = value.coerceIn(0, content.count - 1)
         if (next == chapter) return
-        if (next > chapter) {
-            val words = if (content is OpenBook.Text) content.chapters[chapter].split(Regex("\\s+")).count { it.isNotBlank() }.toLong() else 0L
-            record(book.id, 0, 1, words)
-        }
-        chapter = next
-        prefs.edit().putInt("chapter_${book.id}", next).putBoolean("pending_${book.id}", book.remote).apply()
-        if (book.remote) viewModelScope.launch { syncProgress() }
-    }
-    suspend fun syncProgress() = progressMutex.withLock {
-        val book = current ?: return@withLock
-        if (!book.remote || opened == null) return@withLock
-        try {
-            withContext(Dispatchers.IO) {
-                if (prefs.getBoolean("pending_${book.id}", false)) {
-                    val position = prefs.getInt("chapter_${book.id}", 0)
-                    val body = JSONObject().put("chapter", position).put("offset", 0.0).toString().toRequestBody("application/json".toMediaType())
-                    client.newCall(request("/api/progress/${book.id}").put(body).build()).execute().use { check(it.isSuccessful) { "Sync failed" } }
-                    // A newer local change must not be cleared by an older request.
-                    if (prefs.getInt("chapter_${book.id}", 0) == position) prefs.edit().putBoolean("pending_${book.id}", false).apply()
-                }
-                client.newCall(request("/api/progress/${book.id}").build()).execute().use { response ->
-                    if (response.isSuccessful && !prefs.getBoolean("pending_${book.id}", false)) {
-                        val value = JSONObject(response.body?.string() ?: "{}").optInt("chapter", 0)
-                        withContext(Dispatchers.Main) {
-                            if (current?.id == book.id && !prefs.getBoolean("pending_${book.id}", false)) {
-                                chapter = value.coerceIn(0, (opened?.count ?: 1) - 1)
-                                prefs.edit().putInt("chapter_${book.id}", chapter).apply()
-                            }
-                        }
-                    }
-                }
+        val previous = chapter
+        viewModelScope.launch {
+            val percent = if (content.count <= 1) 0.0 else next * 100.0 / (content.count - 1)
+            db.offline().saveTurn(userId, book.id, position(content, book.format, next), percent, OfflineStore.device(getApplication()), book.remote)
+            chapter = next
+            prefs.edit().putInt("chapter_${book.id}", next).apply()
+            if (next > previous) {
+                val words = if (content is OpenBook.Text) content.chapters[previous].split(Regex("\\s+")).count { it.isNotBlank() }.toLong() else 0L
+                record(book.id, 0, 1, words)
             }
-        } catch (_: Exception) { /* Keep local progress queued for the next sync. */ }
+            if (book.remote) OfflineStore.scheduleSync(getApplication(), 2)
+        }
     }
+    suspend fun syncProgress() { flushSync() }
     fun record(bookId: String, seconds: Long, pages: Long = 0, words: Long = 0) {
         if (seconds <= 0 && pages <= 0 && words <= 0) return
         viewModelScope.launch(Dispatchers.IO) { db.reading().record(bookId, LocalDate.now().toString(), seconds, pages, words) }
     }
-    override fun onCleared() { db.close(); super.onCleared() }
+    override fun onCleared() { super.onCleared() }
 }

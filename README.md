@@ -85,3 +85,42 @@ The Docker build downloads pinned epub.js and JSZip releases, then embeds them a
 - Android progress is chapter/page-level, not the scroll position within a chapter; the web reader also stores an approximate fraction within the chapter. While the reader is in the foreground, it polls approximately every 30 seconds and pushes changes; the last successful write wins. Offline changes are queued locally and retried when reopening or while reading. There is no background sync or multi-user isolation.
 - Room records foreground reading time locally. Page/chapter and word counts are estimates recorded when moving forward, and stats do not sync between devices. Streaks count days with reading time. Back up app data separately if those statistics matter.
 - The server is a single-token service without user management, rate limiting, robust conflict resolution, or a built-in TLS termination layer. Treat it as an early prototype and do not assume security or interoperability has been audited.
+
+## Version 1 API and offline Android
+
+The versioned API is documented in [docs/API.md](docs/API.md). `/api/v1` stores progress per user and keeps the existing API and its progress table unchanged. Set the same user ID on each Android device. The single server token remains shared, so user IDs do not provide security isolation. The Android reader stores EPUB chapter starts as CFIs and PDF/CBZ pages as zero-based indices. The current EPUB reader turns chapters rather than individual screenfuls; its CFI does not track scroll position inside a chapter. The web reader still uses legacy progress and does not sync with the new Android progress table.
+
+The Android library retains catalog metadata, downloaded covers, files, and progress in Room. Use **Download for offline** or **Download all for offline**, and use **Downloaded** or **Storage usage** to manage copies. Downloads resume when possible using HTTP ranges, an ETag, and a final size check. Page changes are queued locally and WorkManager retries with exponential backoff after connectivity returns. A newer remote position is offered on opening the book. Existing reading statistics remain in the original Room table, with a non-destructive migration to the new tables.
+
+EPUB, CBZ, and CBR embedded metadata, PDF title/author, and EPUB/CBZ/CBR/PDF thumbnails use filename and folder fallbacks. CBR extraction depends on the libarchive formats supported by the server image and still needs verification against real archives; Android CBR rendering is not implemented. PDF language/series and externally sourced metadata are not available. Imported offline books do not sync to the server unless they are part of the server library.
+
+### Back up and update the server
+
+From the directory containing `docker-compose.yml` and the configured `.env`, stop the server and back up the named SQLite volume:
+
+```sh
+docker compose stop readcore
+docker compose run --rm --no-deps -T --entrypoint tar readcore -C /data -czf - . > readcore-data-backup.tgz
+```
+
+Then pull and restart the image:
+
+```sh
+docker compose pull readcore
+docker compose up -d --no-deps readcore
+docker compose logs --tail=100 readcore
+```
+
+If using the HTTPS overlay, add `-f docker-compose.yml -f docker-compose.https.yml` after each `docker compose`. The server migrates SQLite automatically on startup without deleting the legacy `progress` table. Restore or roll back from a stopped-server backup if necessary. The checked-out configuration uses port **3435**; change the Compose mappings, Caddy target, and `READCORE_LISTEN` together if your deployed installation uses another port.
+
+For Android, configure the four signing secrets listed above, run the Android workflow on `main` or a version tag, and download `ReadCore-Android-release` from the run. Install it over an existing build only if both APKs use the same signing key. Room migrates the existing statistics database on first launch; back up important app data before upgrading.
+
+### Manual check after CI succeeds
+
+1. Put an EPUB and a PDF inside an author subfolder, trigger `POST /api/v1/scan`, and confirm titles, authors, covers, and removed files in the list.
+2. Set the same server, token, and user ID on phones A and B. Download the EPUB on both. On A, turn pages and wait for sync; open it on B and accept the newer position.
+3. Put A in airplane mode, open a downloaded book, turn pages, and close it. Confirm the book remains readable and **Continue reading** reorders immediately.
+4. Restore A's network, allow WorkManager to retry, then open the book on B and accept A's newer position. Check that the other book's progress and a second user remain separate.
+5. Interrupt a large download, resume it, then open it offline. Check **Downloaded**, storage usage, cover visibility, and **Remove download**.
+
+These changes and the new tests have not yet been compiled or run in GitHub Actions.
