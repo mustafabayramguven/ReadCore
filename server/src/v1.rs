@@ -40,8 +40,8 @@ impl IntoResponse for Error {
         (status, Json(serde_json::json!({"error": message}))).into_response()
     }
 }
-type Result<T> = std::result::Result<T, Error>;
-fn auth(headers: &HeaderMap, state: &App) -> Result<()> { authorize(headers, state).map_err(|_| Error::Unauthorized) }
+type ApiResult<T> = std::result::Result<T, Error>;
+fn auth(headers: &HeaderMap, state: &App) -> ApiResult<()> { authorize(headers, state).map_err(|_| Error::Unauthorized) }
 fn database_error(error: sqlx::Error) -> Error { tracing::error!(%error, "database operation failed"); Error::Internal }
 fn io_error(error: std::io::Error) -> Error { tracing::error!(%error, "file operation failed"); Error::Internal }
 
@@ -171,7 +171,7 @@ struct UserQuery { user_id: Option<String> }
 struct BookQuery { user_id: Option<String>, sort: Option<String> }
 #[derive(Serialize)]
 struct BookEntry { #[serde(flatten)] book: Book, last_read_at: Option<i64>, progress: Option<SyncRecord> }
-fn decode(row: &sqlx::sqlite::SqliteRow) -> Result<SyncRecord> {
+fn decode(row: &sqlx::sqlite::SqliteRow) -> ApiResult<SyncRecord> {
     Ok(SyncRecord {
         book_id: row.try_get("book_id").map_err(database_error)?,
         user_id: row.try_get("user_id").map_err(database_error)?,
@@ -183,12 +183,12 @@ fn decode(row: &sqlx::sqlite::SqliteRow) -> Result<SyncRecord> {
 }
 fn user(value: Option<String>) -> String { value.filter(|s| !s.is_empty()).unwrap_or_else(|| "default".to_owned()) }
 async fn health() -> Json<serde_json::Value> { Json(serde_json::json!({"status": "ok"})) }
-async fn library(State(state): State<Arc<App>>, headers: HeaderMap, Query(query): Query<BookQuery>) -> Result<Json<Vec<BookEntry>>> {
+async fn library(State(state): State<Arc<App>>, headers: HeaderMap, Query(query): Query<BookQuery>) -> ApiResult<Json<Vec<BookEntry>>> {
     auth(&headers, &state)?;
     let user_id = user(query.user_id);
     let rows = sqlx::query("SELECT book_id, user_id, position, percent, device_id, updated_at FROM v1_progress WHERE user_id = ?")
         .bind(user_id).fetch_all(&state.db).await.map_err(database_error)?;
-    let progress: HashMap<String, SyncRecord> = rows.iter().map(decode).collect::<Result<Vec<_>>>()?.into_iter().map(|record| (record.book_id.clone(), record)).collect();
+    let progress: HashMap<String, SyncRecord> = rows.iter().map(decode).collect::<ApiResult<Vec<_>>>()?.into_iter().map(|record| (record.book_id.clone(), record)).collect();
     let entries = scanned(&state).await.map_err(|_| Error::Internal)?;
     let mut books: Vec<BookEntry> = entries.into_iter().map(|(book, _)| {
         let item = progress.get(&book.id).cloned();
@@ -202,25 +202,25 @@ async fn library(State(state): State<Arc<App>>, headers: HeaderMap, Query(query)
     }
     Ok(Json(books))
 }
-async fn rescan(State(state): State<Arc<App>>, headers: HeaderMap) -> Result<Json<serde_json::Value>> {
+async fn rescan(State(state): State<Arc<App>>, headers: HeaderMap) -> ApiResult<Json<serde_json::Value>> {
     auth(&headers, &state)?;
     *state.cache.lock().await = None;
     let books = scanned(&state).await.map_err(|_| Error::Internal)?;
     Ok(Json(serde_json::json!({"count": books.len()})))
 }
-async fn all_sync(State(state): State<Arc<App>>, headers: HeaderMap, Query(query): Query<UserQuery>) -> Result<Json<Vec<SyncRecord>>> {
+async fn all_sync(State(state): State<Arc<App>>, headers: HeaderMap, Query(query): Query<UserQuery>) -> ApiResult<Json<Vec<SyncRecord>>> {
     auth(&headers, &state)?;
     let rows = sqlx::query("SELECT book_id, user_id, position, percent, device_id, updated_at FROM v1_progress WHERE user_id = ?")
         .bind(user(query.user_id)).fetch_all(&state.db).await.map_err(database_error)?;
-    Ok(Json(rows.iter().map(decode).collect::<Result<Vec<_>>>()?))
+    Ok(Json(rows.iter().map(decode).collect::<ApiResult<Vec<_>>>()?))
 }
-async fn one_sync(State(state): State<Arc<App>>, Path((user_id, book_id)): Path<(String, String)>, headers: HeaderMap) -> Result<Json<SyncRecord>> {
+async fn one_sync(State(state): State<Arc<App>>, Path((user_id, book_id)): Path<(String, String)>, headers: HeaderMap) -> ApiResult<Json<SyncRecord>> {
     auth(&headers, &state)?;
     let row = sqlx::query("SELECT book_id, user_id, position, percent, device_id, updated_at FROM v1_progress WHERE user_id = ? AND book_id = ?")
         .bind(user_id).bind(book_id).fetch_optional(&state.db).await.map_err(database_error)?.ok_or(Error::NotFound)?;
     Ok(Json(decode(&row)?))
 }
-async fn write_record(state: &App, record: SyncRecord) -> Result<Json<SyncRecord>> {
+async fn write_record(state: &App, record: SyncRecord) -> ApiResult<Json<SyncRecord>> {
     if record.user_id.is_empty() || record.user_id.len() > 128 || record.book_id.len() != 64 || record.position.is_empty() || record.position.len() > 2048 || record.device_id.is_empty() || record.device_id.len() > 128 || record.updated_at <= 0 || !record.percent.is_finite() || !(0.0..=100.0).contains(&record.percent) {
         return Err(Error::Invalid("Invalid progress record"));
     }
@@ -232,21 +232,21 @@ async fn write_record(state: &App, record: SyncRecord) -> Result<Json<SyncRecord
         .bind(&record.user_id).bind(&record.book_id).fetch_one(&state.db).await.map_err(database_error)?;
     Ok(Json(decode(&row)?))
 }
-async fn put_sync(State(state): State<Arc<App>>, headers: HeaderMap, Json(record): Json<SyncRecord>) -> Result<Json<SyncRecord>> {
+async fn put_sync(State(state): State<Arc<App>>, headers: HeaderMap, Json(record): Json<SyncRecord>) -> ApiResult<Json<SyncRecord>> {
     auth(&headers, &state)?; write_record(&state, record).await
 }
-async fn put_one(State(state): State<Arc<App>>, Path((user_id, book_id)): Path<(String, String)>, headers: HeaderMap, Json(record): Json<SyncRecord>) -> Result<Json<SyncRecord>> {
+async fn put_one(State(state): State<Arc<App>>, Path((user_id, book_id)): Path<(String, String)>, headers: HeaderMap, Json(record): Json<SyncRecord>) -> ApiResult<Json<SyncRecord>> {
     auth(&headers, &state)?;
     if record.user_id != user_id || record.book_id != book_id { return Err(Error::Invalid("Path and payload do not match")); }
     write_record(&state, record).await
 }
-async fn book_path(state: &App, id: &str) -> Result<(Book, std::path::PathBuf)> {
+async fn book_path(state: &App, id: &str) -> ApiResult<(Book, std::path::PathBuf)> {
     let (book, path) = scanned(state).await.map_err(|_| Error::Internal)?.into_iter().find(|(book, _)| book.id == id).ok_or(Error::NotFound)?;
     let path = tokio::fs::canonicalize(path).await.map_err(|_| Error::NotFound)?;
     if !path.starts_with(&state.library) { return Err(Error::NotFound); }
     Ok((book, path))
 }
-async fn download(State(state): State<Arc<App>>, Path(id): Path<String>, headers: HeaderMap) -> Result<Response> {
+async fn download(State(state): State<Arc<App>>, Path(id): Path<String>, headers: HeaderMap) -> ApiResult<Response> {
     auth(&headers, &state)?;
     let (book, path) = book_path(&state, &id).await?;
     let mut file = tokio::fs::File::open(path).await.map_err(io_error)?;
@@ -278,7 +278,7 @@ async fn download(State(state): State<Arc<App>>, Path(id): Path<String>, headers
     if requested.is_some() { response.headers_mut().insert(header::CONTENT_RANGE, HeaderValue::from_str(&format!("bytes {}-{}/{}", start, size - 1, size)).map_err(|_| Error::Internal)?); }
     Ok(response)
 }
-async fn thumbnail(State(state): State<Arc<App>>, Path(id): Path<String>, headers: HeaderMap) -> Result<Response> {
+async fn thumbnail(State(state): State<Arc<App>>, Path(id): Path<String>, headers: HeaderMap) -> ApiResult<Response> {
     auth(&headers, &state)?;
     let (book, path) = book_path(&state, &id).await?;
     let metadata = tokio::fs::metadata(&path).await.map_err(io_error)?;
@@ -353,7 +353,7 @@ mod tests {
         migrate(&db).await.unwrap();
         let state = App { library: root.path().to_path_buf(), token_hash: Sha256::digest(b"test-secret-token").into(), db, cache: tokio::sync::Mutex::new(None) };
         let record = |user: &str, time, position: &str| SyncRecord { book_id: id.clone(), user_id: user.into(), position: position.into(), percent: 10.0, device_id: "device".into(), updated_at: time };
-        write_record(&state, record("alice", 200, "pdf:2")).await.unwrap();
+        let _ = write_record(&state, record("alice", 200, "pdf:2")).await.unwrap();
         let older = write_record(&state, record("alice", 100, "pdf:1")).await.unwrap().0;
         assert_eq!(older.position, "pdf:2");
         let newer = write_record(&state, record("alice", 300, "pdf:3")).await.unwrap().0;
