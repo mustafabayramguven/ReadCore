@@ -18,7 +18,11 @@ import org.xmlpull.v1.XmlPullParser
 
 /** This text-first reader does not execute book HTML or extract archive paths to disk. */
 sealed class OpenBook {
-    data class Text(val chapters: List<String>, val spineIndices: List<Int> = chapters.indices.toList()) : OpenBook()
+    data class Text(val chapters: List<String>, val spineIndices: List<Int> = chapters.indices.toList()) : OpenBook() {
+        val paragraphs: List<List<String>> by lazy { chapters.map(Locator::paragraphs) }
+        val paragraphWeights: List<List<Int>> by lazy { paragraphs.map { chapter -> chapter.map(Locator::weight) } }
+        val chapterWeights: List<Int> by lazy { paragraphWeights.map { it.sum() } }
+    }
     data class Pdf(val file: File, val pageCount: Int) : OpenBook()
     data class Comic(val file: File, val entries: List<String>) : OpenBook()
     val count: Int get() = when (this) { is Text -> chapters.size; is Pdf -> pageCount; is Comic -> entries.size }

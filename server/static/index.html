@@ -23,6 +23,9 @@
       <form id="login-form">
         <label for="token">Library token</label>
         <input id="token" name="token" type="password" autocomplete="off" required>
+        <label for="user-id">User ID</label>
+        <input id="user-id" name="user-id" type="text" autocomplete="username" placeholder="default" maxlength="128">
+        <p class="hint">Use the same User ID as the Android app to sync your reading position.</p>
         <button type="submit">Open library</button>
       </form>
       <p id="login-error" class="error" role="alert"></p>

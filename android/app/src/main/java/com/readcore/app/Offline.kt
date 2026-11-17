@@ -37,7 +37,8 @@ data class CachedBook(
     val downloadedBytes: Long,
     val etag: String?,
     val series: String? = null,
-    val language: String? = null
+    val language: String? = null,
+    val downloadError: String? = null
 )
 
 @Entity(primaryKeys = ["userId", "bookId"])
@@ -52,7 +53,10 @@ data class LocalProgress(
     val remotePosition: String? = null,
     val remotePercent: Double? = null,
     val remoteDevice: String? = null,
-    val remoteUpdatedAt: Long? = null
+    val remoteUpdatedAt: Long? = null,
+    /** Fraction (0..1) of the chapter or page in [position]; null for chapter-start positions. */
+    val progression: Double? = null,
+    val remoteProgression: Double? = null
 )
 
 data class LibraryRow(@Embedded val book: CachedBook, val lastReadAt: Long, val percent: Double)
@@ -72,8 +76,9 @@ abstract class OfflineDao {
     @Transaction open suspend fun mergeBook(book: CachedBook) {
         if (insertBook(book) == -1L) updateMetadata(book.id, book.title, book.author, book.format, book.size, book.remote, book.series, book.language)
     }
-    @Query("UPDATE CachedBook SET localPath=:path, downloadState=:state, downloadedBytes=:bytes, etag=:etag WHERE id=:id")
-    abstract suspend fun setDownload(id: String, path: String?, state: String, bytes: Long, etag: String?)
+    @Query("UPDATE CachedBook SET localPath=:path, downloadState=:state, downloadedBytes=:bytes, etag=:etag, downloadError=:error WHERE id=:id")
+    abstract suspend fun setDownload(id: String, path: String?, state: String, bytes: Long, etag: String?, error: String? = null)
+    @Query("UPDATE CachedBook SET downloadedBytes=:bytes WHERE id=:id") abstract suspend fun setDownloaded(id: String, bytes: Long)
     @Query("UPDATE CachedBook SET coverPath=:path WHERE id=:id") abstract suspend fun setCover(id: String, path: String?)
     @Query("SELECT * FROM LocalProgress WHERE userId=:userId AND bookId=:bookId") abstract suspend fun progress(userId: String, bookId: String): LocalProgress?
     @Query("SELECT * FROM LocalProgress WHERE pending=1") abstract suspend fun pending(): List<LocalProgress>
@@ -85,18 +90,19 @@ abstract class OfflineDao {
         putProgress(remote)
         return true
     }
-    @Transaction open suspend fun saveTurn(userId: String, bookId: String, position: String, percent: Double, deviceId: String, remote: Boolean): LocalProgress {
+    @Transaction open suspend fun saveTurn(userId: String, bookId: String, position: String, percent: Double, deviceId: String, remote: Boolean, progression: Double? = null, after: Long = 0): LocalProgress {
         val old = progress(userId, bookId)
-        val timestamp = maxOf(System.currentTimeMillis(), (old?.updatedAt ?: 0L) + 1)
-        val next = LocalProgress(userId, bookId, position, percent, deviceId, timestamp, pending = remote)
+        // Never older than what this device already knows about, so a deliberate choice wins.
+        val timestamp = maxOf(System.currentTimeMillis(), (old?.updatedAt ?: 0L) + 1, (old?.remoteUpdatedAt ?: 0L) + 1, after + 1)
+        val next = LocalProgress(userId, bookId, position, percent, deviceId, timestamp, pending = remote, progression = progression)
         putProgress(next)
         return next
     }
     @Query("UPDATE LocalProgress SET pending=0 WHERE userId=:userId AND bookId=:bookId AND updatedAt=:updatedAt")
     abstract suspend fun markSynced(userId: String, bookId: String, updatedAt: Long)
-    @Query("UPDATE LocalProgress SET pending=0, remotePosition=:position, remotePercent=:percent, remoteDevice=:device, remoteUpdatedAt=:updatedAt WHERE userId=:userId AND bookId=:bookId AND updatedAt=:localUpdatedAt")
-    abstract suspend fun storeRemoteCandidate(userId: String, bookId: String, localUpdatedAt: Long, position: String, percent: Double, device: String, updatedAt: Long)
-    @Query("UPDATE LocalProgress SET remotePosition=NULL, remotePercent=NULL, remoteDevice=NULL, remoteUpdatedAt=NULL WHERE userId=:userId AND bookId=:bookId")
+    @Query("UPDATE LocalProgress SET pending=0, remotePosition=:position, remotePercent=:percent, remoteDevice=:device, remoteUpdatedAt=:updatedAt, remoteProgression=:progression WHERE userId=:userId AND bookId=:bookId AND updatedAt=:localUpdatedAt")
+    abstract suspend fun storeRemoteCandidate(userId: String, bookId: String, localUpdatedAt: Long, position: String, percent: Double, device: String, updatedAt: Long, progression: Double?)
+    @Query("UPDATE LocalProgress SET remotePosition=NULL, remotePercent=NULL, remoteDevice=NULL, remoteUpdatedAt=NULL, remoteProgression=NULL WHERE userId=:userId AND bookId=:bookId")
     abstract suspend fun clearCandidate(userId: String, bookId: String)
 }
 
@@ -108,8 +114,15 @@ object OfflineStore {
             db.execSQL("CREATE TABLE IF NOT EXISTS LocalProgress (userId TEXT NOT NULL, bookId TEXT NOT NULL, position TEXT NOT NULL, percent REAL NOT NULL, deviceId TEXT NOT NULL, updatedAt INTEGER NOT NULL, pending INTEGER NOT NULL, remotePosition TEXT, remotePercent REAL, remoteDevice TEXT, remoteUpdatedAt INTEGER, PRIMARY KEY(userId, bookId))")
         }
     }
+    val migration3 = object : Migration(2, 3) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL("ALTER TABLE CachedBook ADD COLUMN downloadError TEXT")
+            db.execSQL("ALTER TABLE LocalProgress ADD COLUMN progression REAL")
+            db.execSQL("ALTER TABLE LocalProgress ADD COLUMN remoteProgression REAL")
+        }
+    }
     fun db(context: Context): ReadDatabase = instance ?: synchronized(this) {
-        instance ?: Room.databaseBuilder(context.applicationContext, ReadDatabase::class.java, "reading.db").addMigrations(migration).build().also { instance = it }
+        instance ?: Room.databaseBuilder(context.applicationContext, ReadDatabase::class.java, "reading.db").addMigrations(migration, migration3).build().also { instance = it }
     }
     fun user(context: Context): String = context.getSharedPreferences("readcore", Context.MODE_PRIVATE).getString("userId", "default") ?: "default"
     fun device(context: Context): String {
@@ -124,11 +137,16 @@ object OfflineStore {
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 10, TimeUnit.SECONDS).build()
         WorkManager.getInstance(context).enqueueUniqueWork("readcore-sync", ExistingWorkPolicy.REPLACE, request)
     }
+    fun downloadWork(bookId: String) = "readcore-download-$bookId"
+    /**
+     * REPLACE so that tapping Download always starts now, even when an earlier attempt is sleeping
+     * in exponential backoff; the worker resumes from the partial file with HTTP ranges.
+     */
     fun download(context: Context, bookId: String) {
         val request = OneTimeWorkRequestBuilder<BookDownloadWorker>()
             .setInputData(workDataOf("bookId" to bookId))
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 10, TimeUnit.SECONDS).build()
-        WorkManager.getInstance(context).enqueueUniqueWork("readcore-download-$bookId", ExistingWorkPolicy.KEEP, request)
+            .setBackoffCriteria(BackoffPolicy.LINEAR, 15, TimeUnit.SECONDS).build()
+        WorkManager.getInstance(context).enqueueUniqueWork(downloadWork(bookId), ExistingWorkPolicy.REPLACE, request)
     }
 }

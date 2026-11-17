@@ -14,7 +14,18 @@ class ResumeTest {
     }
     @Test fun fullResponseRestartsFromZero() {
         assertEquals(2048L, resumeTotal(200, 1024, null, 2048))
-        assertNull(resumeTotal(200, 1024, null, -1))
+        // Chunked responses through a proxy have no length: fall back to the catalog size, else unknown.
+        assertEquals(4096L, resumeTotal(200, 0, null, -1, expected = 4096))
+        assertEquals(-1L, resumeTotal(200, 0, null, -1))
+        // A 206 without Content-Length is still accepted when Content-Range is consistent.
+        assertEquals(2048L, resumeTotal(206, 1024, "bytes 1024-2047/2048", -1))
+    }
+    @Test fun readsUnknownLengthToTheEnd() = runBlocking {
+        val file = kotlin.io.path.createTempFile().toFile()
+        try {
+            assertEquals(5L, writeDownload(file, 0, -1, "hello".byteInputStream()))
+            assertArrayEquals("hello".toByteArray(), file.readBytes())
+        } finally { file.delete() }
     }
     @Test fun resumesAndReplacesThePartialFile() = runBlocking {
         val file = kotlin.io.path.createTempFile().toFile()

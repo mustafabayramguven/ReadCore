@@ -18,6 +18,7 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -51,6 +52,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.LocalDate
@@ -75,6 +77,20 @@ fun ReadCoreApp(model: ReadModel = viewModel()) {
     val route = nav.currentBackStackEntryAsState().value?.destination?.route
     val snack = remember { SnackbarHostState() }
     LaunchedEffect(model.message) { model.message?.let { snack.showSnackbar(it); model.message = null } }
+    // A book tapped before it was downloaded opens as soon as its file is ready.
+    LaunchedEffect(model.readyToOpen) {
+        val book = model.readyToOpen ?: return@LaunchedEffect
+        model.readyToOpen = null
+        model.open(book) { if (nav.currentDestination?.route != "reader") nav.navigate("reader") }
+    }
+    // Download progress is shown as a notification on Android 13+ only with this permission.
+    if (Build.VERSION.SDK_INT >= 33) {
+        val context = LocalContext.current
+        val notify = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+        LaunchedEffect(Unit) {
+            if (context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) notify.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
     Scaffold(
         snackbarHost = { SnackbarHost(snack) },
         bottomBar = {
@@ -136,23 +152,35 @@ fun LibraryScreen(model: ReadModel, open: (LibraryBook) -> Unit) {
                     Spacer(Modifier.height(6.dp))
                     Text(book.title, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelLarge)
                     if (book.author.isNotBlank()) Text(book.author, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                    if (book.percent >= 1) Text("${book.percent.toInt()}% read", style = MaterialTheme.typography.labelSmall)
                     when {
                         book.localPath != null -> {
-                            Text("Available offline", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                            Text("Downloaded", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                             TextButton(onClick = { model.removeDownload(book) }) { Text("Remove download") }
                         }
                         book.downloadState == "queued" || book.downloadState == "downloading" -> {
-                            val fraction = if (book.size > 0) (book.downloadedBytes.toFloat() / book.size).coerceIn(0f, 1f) else 0f
-                            LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth())
-                            Text("${book.downloadedBytes / 1024} KB downloaded", style = MaterialTheme.typography.bodySmall)
+                            if (book.downloadState == "downloading" && book.size > 0) {
+                                LinearProgressIndicator(progress = { (book.downloadedBytes.toFloat() / book.size).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                                Text("${megabytes(book.downloadedBytes)} / ${megabytes(book.size)} MB", style = MaterialTheme.typography.bodySmall)
+                            } else {
+                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                                Text(book.downloadError ?: if (book.downloadState == "queued") "Waiting to download…" else "${megabytes(book.downloadedBytes)} MB", style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            }
+                            TextButton(onClick = { model.cancelDownload(book) }) { Text("Cancel") }
                         }
-                        book.remote -> TextButton(onClick = { model.download(book) }) { Text("Download for offline") }
+                        book.downloadState == "failed" -> {
+                            Text(book.downloadError ?: "Download failed", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                            TextButton(onClick = { model.download(book) }) { Text("Retry") }
+                        }
+                        book.remote -> TextButton(onClick = { model.download(book) }) { Text("Download") }
                     }
                 }
             }
         }
     }
 }
+
+private fun megabytes(bytes: Long): String = "%.1f".format(bytes / (1024.0 * 1024.0))
 
 @Composable
 fun BookCover(model: ReadModel, book: LibraryBook, modifier: Modifier = Modifier) {
@@ -269,9 +297,9 @@ fun ReaderScreen(model: ReadModel, back: () -> Unit) {
     val book = model.current ?: return
     val content = model.opened ?: return
     model.remoteOffer?.let { offer ->
-        AlertDialog(onDismissRequest = { model.resolveRemote(false) }, title = { Text("Continue reading?") },
-            text = { Text("Continue from page ${offer.label} on ${offer.progress.deviceId}?") },
-            confirmButton = { TextButton(onClick = { model.resolveRemote(true) }) { Text("Continue") } },
+        AlertDialog(onDismissRequest = { model.resolveRemote(false) }, title = { Text("Go to your latest position?") },
+            text = { Text("You were at ${offer.label} on ${offer.progress.deviceId.substringBeforeLast('-')}, ${android.text.format.DateUtils.getRelativeTimeSpanString(offer.progress.updatedAt)}.") },
+            confirmButton = { TextButton(onClick = { model.resolveRemote(true) }) { Text("Go there") } },
             dismissButton = { TextButton(onClick = { model.resolveRemote(false) }) { Text("Stay here") } })
     }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
@@ -286,7 +314,7 @@ fun ReaderScreen(model: ReadModel, back: () -> Unit) {
     DisposableEffect(lifecycle, book.id) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_RESUME -> { resumed = true; started = SystemClock.elapsedRealtime() }
+                Lifecycle.Event.ON_RESUME -> { resumed = true; started = SystemClock.elapsedRealtime(); model.readerResumed() }
                 Lifecycle.Event.ON_PAUSE -> { flushTime(); model.flushSync(); resumed = false; started = 0L }
                 else -> Unit
             }
@@ -306,19 +334,45 @@ fun ReaderScreen(model: ReadModel, back: () -> Unit) {
     Scaffold(topBar = { TopAppBar(title = { Text(book.title, maxLines = 1, overflow = TextOverflow.Ellipsis) }, navigationIcon = { IconButton(onClick = back) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } }) }, bottomBar = {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             TextButton(onClick = { model.changeChapter(chapter - 1) }, enabled = chapter > 0) { Text("Previous") }
-            Text("${chapter + 1} / ${content.count}")
+            val percent = if (content is OpenBook.Text) Locator.percent(content.chapterWeights, chapter, model.progression) else if (content.count <= 1) 100.0 else chapter * 100.0 / (content.count - 1)
+            Text("${chapter + 1} / ${content.count} · ${percent.toInt()}%")
             TextButton(onClick = { model.changeChapter(chapter + 1) }, enabled = chapter < content.count - 1) { Text("Next") }
         }
     }) { padding ->
         Box(Modifier.fillMaxSize().padding(padding).background(bg)) {
             if (content is OpenBook.Text) {
-                val paragraphs = remember(content, chapter) { content.chapters[chapter].split(Regex("\\n{2,}")).filter { it.isNotBlank() } }
+                val paragraphs = content.paragraphs[chapter]
+                val weights = content.paragraphWeights[chapter]
                 key(chapter) {
-                    LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(model.paragraph.dp), modifier = Modifier.fillMaxSize()) {
-                        items(paragraphs) { paragraph -> Text(paragraph.trim(), color = fg, fontFamily = family, fontSize = model.fontSize.sp, lineHeight = (model.fontSize * model.lineHeight / 100f).sp) }
+                    val listState = rememberLazyListState()
+                    // Scroll to a restored or synced position, down to the line inside the paragraph.
+                    val target = model.jump
+                    LaunchedEffect(target) {
+                        if (target == null || target.chapter != chapter) return@LaunchedEffect
+                        val (index, within) = Locator.locate(weights, target.progression)
+                        if (paragraphs.isNotEmpty()) {
+                            listState.scrollToItem(index)
+                            val height = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == index }?.size ?: 0
+                            if (height > 0 && within > 0) listState.scrollToItem(index, (within * height).toInt())
+                        }
+                        model.consumeJump(target)
+                    }
+                    // Report the reading point once scrolling settles; the model saves and syncs it.
+                    LaunchedEffect(listState) {
+                        snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }.collectLatest { (index, offset) ->
+                            delay(800)
+                            val height = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == index }?.size ?: return@collectLatest
+                            val within = if (height > 0) offset.toDouble() / height else 0.0
+                            val value = if (!listState.canScrollForward && listState.canScrollBackward) 1.0 else Locator.progressionOf(weights, index, within)
+                            model.updateProgression(chapter, value)
+                        }
+                    }
+                    LazyColumn(state = listState, contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(model.paragraph.dp), modifier = Modifier.fillMaxSize()) {
+                        items(paragraphs) { paragraph -> Text(paragraph, color = fg, fontFamily = family, fontSize = model.fontSize.sp, lineHeight = (model.fontSize * model.lineHeight / 100f).sp) }
                     }
                 }
             } else {
+                LaunchedEffect(model.jump) { model.jump?.let(model::consumeJump) }
                 var bitmap by remember(content, chapter) { mutableStateOf<android.graphics.Bitmap?>(null) }
                 var error by remember(content, chapter) { mutableStateOf<String?>(null) }
                 LaunchedEffect(content, chapter) { try { bitmap = withContext(Dispatchers.IO) { ReaderCore.page(content, chapter) } } catch (e: Exception) { error = e.message ?: "Cannot render page" } }

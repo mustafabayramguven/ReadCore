@@ -88,6 +88,12 @@ The Docker build downloads pinned epub.js and JSZip releases, then embeds them a
 
 ## Version 1 API and offline Android
 
+### Reading sync
+
+Positions sync like Google Play Books: the Android reader saves where you are scrolled inside the chapter (to the line), and the web reader saves its exact CFI plus the same character-based position. Positions are pushed a few seconds after you stop scrolling or turning pages and when you leave the book or the app. When you open a book, or return to the app or browser tab, the newest position from another device is fetched: a device with no position of its own jumps there directly, otherwise you are asked whether to go there. Choosing **Stay here** makes the current position the newest one. Use the same **User ID** in the Android app and on the web login page (both default to `default`). Percentages are weighted by chapter length.
+
+Downloads run in the background with a progress notification, resume after interruptions, and show an error with **Retry** if they fail (for example a wrong token or a removed book). Tapping a book that is not downloaded yet downloads it and opens it when ready.
+
 The versioned API is documented in [docs/API.md](docs/API.md). `/api/v1` stores progress per user and keeps the existing API and its progress table unchanged. Set the same user ID on each Android device. The single server token remains shared, so user IDs do not provide security isolation. The Android reader stores EPUB chapter starts as CFIs and PDF/CBZ pages as zero-based indices. The current EPUB reader turns chapters rather than individual screenfuls; its CFI does not track scroll position inside a chapter. The web reader still uses legacy progress and does not sync with the new Android progress table.
 
 The Android library retains catalog metadata, downloaded covers, files, and progress in Room. Use **Download for offline** or **Download all for offline**, and use **Downloaded** or **Storage usage** to manage copies. Downloads resume when possible using HTTP ranges, an ETag, and a final size check. Page changes are queued locally and WorkManager retries with exponential backoff after connectivity returns. A newer remote position is offered on opening the book. Existing reading statistics remain in the original Room table, with a non-destructive migration to the new tables.
