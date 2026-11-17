@@ -62,3 +62,4 @@ input, select { color: #f3f1fa; background: var(--surface); border: 1px solid #4
   .reader-settings { margin-left: auto; }
   .book-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
 }
+.hint { font-size: .85rem; margin: -.3rem 0 0; }

@@ -16,13 +16,15 @@ The server defaults to `0.0.0.0:3435`, configurable with `READCORE_LISTEN`. All 
 - `GET /opds/v1.2/catalog`: authenticated OPDS acquisition feed.
 
 ```json
-{"book_id":"<64-character-id>","user_id":"default","position":"epubcfi(/6/2!/4)","percent":12.5,"device_id":"phone-a","updated_at":1793600000000}
+{"book_id":"<64-character-id>","user_id":"default","position":"epubcfi(/6/2!/4)","percent":12.5,"progression":0.42,"device_id":"phone-a","updated_at":1793600000000}
 ```
+
+`progression` (optional, 0..1 or `null`) is the fraction of the chapter's non-whitespace characters that come before the reading point, in the chapter named by `position`. Whitespace is ignored so the Android text reader and the web DOM agree. The web reader also sends its exact CFI in `position`; the Android reader sends the chapter-start CFI. Clients that omit `progression` keep working.
 
 `position` is an EPUB CFI or `pdf:<zero-based-page>`, `cbz:<zero-based-page>`, or `mobi:<zero-based-section>` for the current Android reader. The newest `updated_at` wins; equal timestamps leave the existing value unchanged. Device clocks must be reasonably synchronized. Timestamps are supplied by clients, so this is not safe against malicious clients sharing a token.
 
 ## Existing endpoints
 
-The original routes remain available: `GET /api/books`, `GET /api/books/{id}/file`, `GET /api/books/{id}/cover`, `GET /api/progress/{id}`, `PUT /api/progress/{id}`, and `GET /opds`. The legacy progress API uses `{ "chapter": 0, "offset": 0.0 }` and its original shared progress table; it does not automatically migrate or synchronize with `/api/v1/sync`. The web UI currently uses this legacy progress API. Static web files at `/`, `/app.js`, `/styles.css`, and `/vendor/*` are public.
+The original routes remain available: `GET /api/books`, `GET /api/books/{id}/file`, `GET /api/books/{id}/cover`, `GET /api/progress/{id}`, `PUT /api/progress/{id}`, and `GET /opds`. The legacy progress API uses `{ "chapter": 0, "offset": 0.0 }` and its original shared progress table; it does not automatically migrate or synchronize with `/api/v1/sync`. The web UI now uses `/api/v1/sync` and reads the legacy record only when no v1 record exists. Static web files at `/`, `/app.js`, `/styles.css`, and `/vendor/*` are public.
 
 Invalid input returns `400`, missing resources `404`, invalid ranges `416`, missing/invalid credentials `401`, and internal errors `500`.

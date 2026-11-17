@@ -3,7 +3,11 @@
 const $ = (id) => document.getElementById(id);
 const views = { login: $('login'), library: $('library'), reader: $('reader') };
 const tokenKey = 'readcore.token';
+const userKey = 'readcore.user';
+const deviceKey = 'readcore.device';
 let token = localStorage.getItem(tokenKey) || '';
+let userId = localStorage.getItem(userKey) || 'default';
+let lastSavedAt = 0;
 let coverController = null;
 let coverUrls = [];
 let epubBook = null;
@@ -15,6 +19,69 @@ let lastLocation = null;
 let progressTimer = null;
 let progressQueue = Promise.resolve();
 let navigating = false;
+let chapterWeights = null;
+
+// Shared with the Android reader: progression is the fraction of the chapter's non-whitespace
+// characters before the reading point, so both apps resume on the same sentence.
+function deviceId() {
+  let id = localStorage.getItem(deviceKey);
+  if (!id) { id = `Browser-${Math.random().toString(16).slice(2, 10)}`; localStorage.setItem(deviceKey, id); }
+  return id;
+}
+const weigh = (text) => (text || '').replace(/\s+/g, '').length;
+function progressionAt(doc, range) {
+  const total = weigh(doc.body && doc.body.textContent);
+  if (!total) return 0;
+  const before = doc.createRange();
+  before.setStart(doc.body, 0);
+  before.setEnd(range.startContainer, range.startOffset);
+  return Math.max(0, Math.min(1, weigh(before.toString()) / total));
+}
+function rangeAt(doc, progression) {
+  if (!doc.body) return null;
+  let remaining = Math.floor(progression * weigh(doc.body.textContent));
+  const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+  let last = null;
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const text = node.textContent;
+    for (let i = 0; i < text.length; i += 1) {
+      if (/\s/.test(text[i])) continue;
+      if (remaining === 0) { const range = doc.createRange(); range.setStart(node, i); range.collapse(true); return range; }
+      remaining -= 1;
+      last = [node, i];
+    }
+  }
+  if (!last) return null;
+  const range = doc.createRange(); range.setStart(last[0], last[1]); range.collapse(true);
+  return range;
+}
+function spineIndexOf(position) {
+  const match = /^epubcfi\(\/6\/(\d+)/.exec(position || '');
+  return match ? Number(match[1]) / 2 - 1 : null;
+}
+// Book-wide percent weighted by chapter length, matching the Android app. Computed in the
+// background after opening; until then the chapter count gives an estimate.
+async function measureChapters(book, session) {
+  const weights = [];
+  for (const section of book.spine.spineItems) {
+    if (session !== readerSession) return;
+    try {
+      await section.load(book.load.bind(book));
+      weights.push(weigh(section.document && section.document.body && section.document.body.textContent));
+      section.unload();
+    } catch (error) { weights.push(0); }
+  }
+  if (session === readerSession) chapterWeights = weights;
+}
+function bookPercent(index, progression) {
+  const total = chapterWeights ? chapterWeights.reduce((a, b) => a + b, 0) : 0;
+  if (total > 0) {
+    const before = chapterWeights.slice(0, index).reduce((a, b) => a + b, 0);
+    return Math.max(0, Math.min(100, (before + (chapterWeights[index] || 0) * progression) * 100 / total));
+  }
+  const count = epubBook ? epubBook.spine.spineItems.length : 1;
+  return Math.max(0, Math.min(100, (index + progression) * 100 / Math.max(1, count)));
+}
 
 const themes = {
   black: { background: '#000000', color: '#eaeaea' },
@@ -62,7 +129,7 @@ function displayError(error, target) {
 
 async function loadCover(book, image, controller) {
   try {
-    const response = await api(`/api/books/${encodeURIComponent(book.id)}/cover`, { signal: controller.signal });
+    const response = await api(`/api/v1/books/${encodeURIComponent(book.id)}/cover`, { signal: controller.signal });
     const blob = await response.blob();
     if (controller.signal.aborted) return;
     const url = URL.createObjectURL(blob);
@@ -79,7 +146,7 @@ async function loadCover(book, image, controller) {
 async function downloadBook(book, button) {
   button.disabled = true;
   try {
-    const response = await api(`/api/books/${encodeURIComponent(book.id)}/file`);
+    const response = await api(`/api/v1/books/${encodeURIComponent(book.id)}/download`);
     const url = URL.createObjectURL(await response.blob());
     const link = document.createElement('a');
     link.href = url;
@@ -125,13 +192,15 @@ function bookCard(book, controller) {
   const author = document.createElement('p');
   author.className = 'book-author';
   author.textContent = book.author || '';
+  const percent = book.progress ? Math.floor(book.progress.percent) : 0;
+  if (percent > 0) author.textContent += `${book.author ? ' · ' : ''}${percent}% read`;
   const action = document.createElement('button');
   action.type = 'button';
   action.className = 'book-action quiet';
   action.textContent = isEpub ? 'Read' : 'Download';
   action.addEventListener('click', () => isEpub ? readBook(book) : downloadBook(book, action));
   card.append(cover, title, author, action);
-  if (isEpub) loadCover(book, image, controller);
+  loadCover(book, image, controller);
   return card;
 }
 
@@ -142,7 +211,7 @@ async function loadLibrary() {
   $('books').replaceChildren();
   $('library-status').textContent = 'Loading your library…';
   try {
-    const response = await api('/api/books', { signal: controller.signal });
+    const response = await api(`/api/v1/books?sort=recent&user_id=${encodeURIComponent(userId)}`, { signal: controller.signal });
     const books = await response.json();
     if (controller.signal.aborted) return;
     $('library-status').textContent = books.length ? '' : 'No books found in your library.';
@@ -154,18 +223,33 @@ async function loadLibrary() {
   }
 }
 
-function saveProgress(book, location, credential) {
+function syncRecord(book, location) {
   const start = location && location.start;
-  if (!start || !Number.isInteger(start.index) || start.index < 0) return;
-  const displayed = start.displayed || {};
-  const page = Number(displayed.page) || 1;
-  const total = Number(displayed.total) || 1;
-  const offset = total > 1 ? Math.max(0, Math.min(1, (page - 1) / (total - 1))) : 0;
-  const payload = JSON.stringify({ chapter: start.index, offset });
+  if (!start || !Number.isInteger(start.index) || start.index < 0 || !start.cfi) return null;
+  let progression = null;
+  try {
+    const contents = (rendition.getContents() || []).find((c) => c.sectionIndex === start.index);
+    const range = rendition.getRange(start.cfi);
+    if (contents && range) progression = progressionAt(contents.document, range);
+  } catch (error) { /* fall back to the page fraction below */ }
+  if (progression === null) {
+    const displayed = start.displayed || {};
+    progression = displayed.total > 1 ? Math.max(0, Math.min(1, (displayed.page - 1) / (displayed.total - 1))) : 0;
+  }
+  return {
+    book_id: book.id, user_id: userId, position: start.cfi, percent: bookPercent(start.index, progression),
+    progression, device_id: deviceId(), updated_at: Math.max(Date.now(), lastSavedAt + 1)
+  };
+}
+
+function saveProgress(book, location, credential) {
+  const record = syncRecord(book, location);
+  if (!record) return;
+  lastSavedAt = record.updated_at;
   // Serialize writes so a slow request cannot overwrite a newer position.
   progressQueue = progressQueue.catch(() => {}).then(async () => {
-    await api(`/api/progress/${encodeURIComponent(book.id)}`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: payload
+    await api('/api/v1/sync', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(record), keepalive: true
     }, credential);
   }).catch((error) => {
     if (openBook && openBook.id === book.id) displayError(error, $('reader-status'));
@@ -181,25 +265,32 @@ function queueProgress(location) {
   progressTimer = setTimeout(() => {
     progressTimer = null;
     saveProgress(book, location, credential);
-  }, 350);
+  }, 1000);
 }
 
-function closeReader() {
-  readerSession += 1;
+function flushProgress() {
   if (progressTimer && lastLocation && openBook) {
     clearTimeout(progressTimer);
     progressTimer = null;
     saveProgress(openBook, lastLocation, token);
   }
+}
+
+function closeReader() {
+  readerSession += 1;
+  flushProgress();
   if (epubBook) epubBook.destroy();
   else if (rendition) rendition.destroy();
   rendition = null;
   epubBook = null;
   openBook = null;
   lastLocation = null;
+  chapterWeights = null;
+  lastSavedAt = 0;
   restoring = false;
   navigating = false;
   $('viewer').replaceChildren();
+  $('reader-status').replaceChildren();
 }
 
 function applyReaderSettings() {
@@ -212,26 +303,32 @@ function applyReaderSettings() {
   rendition.themes.fontSize(`${$('font-size').value}%`);
 }
 
-async function getProgress(id) {
+async function getSync(id) {
   try {
-    return await (await api(`/api/progress/${encodeURIComponent(id)}`)).json();
+    return await (await api(`/api/v1/sync/${encodeURIComponent(userId)}/${encodeURIComponent(id)}`)).json();
   } catch (error) {
     if (error.status === 404) return null;
     throw error;
   }
 }
 
-async function restoreProgress(progress, session) {
+async function getLegacyProgress(id) {
+  try {
+    return await (await api(`/api/progress/${encodeURIComponent(id)}`)).json();
+  } catch (error) {
+    return null;
+  }
+}
+
+async function restoreLegacy(progress, session) {
   const index = progress && Number.isInteger(progress.chapter) ? progress.chapter : 0;
   const section = epubBook.spine.get(index);
   await rendition.display(section ? section.href : undefined);
   if (session !== readerSession || !progress || !section) return;
   const current = await Promise.resolve(rendition.currentLocation());
   const total = current && current.start && current.start.displayed ? current.start.displayed.total : 1;
-  const fraction = Math.max(0, Math.min(1, Number(progress.offset) || 0));
-  const targetPage = 1 + Math.round(fraction * Math.max(0, total - 1));
+  const targetPage = 1 + Math.round(Math.max(0, Math.min(1, Number(progress.offset) || 0)) * Math.max(0, total - 1));
   let currentPage = current && current.start && current.start.displayed ? current.start.displayed.page : 1;
-  // The server stores a chapter index and fraction, so advance within that chapter.
   while (currentPage < targetPage && session === readerSession) {
     await rendition.next();
     const next = await Promise.resolve(rendition.currentLocation());
@@ -239,6 +336,48 @@ async function restoreProgress(progress, session) {
     currentPage = next.start.displayed.page;
   }
 }
+
+// Positions written by a browser carry an exact CFI; Android positions name the chapter and the
+// character fraction inside it, which is turned into a CFI for the same sentence here.
+async function goToRecord(record, session) {
+  if (record.device_id && record.device_id.startsWith('Browser-')) {
+    try { await rendition.display(record.position); return; } catch (error) { /* use progression */ }
+  }
+  const section = epubBook.spine.get(spineIndexOf(record.position) ?? 0);
+  await rendition.display(section ? section.href : undefined);
+  if (session !== readerSession || !section || !record.progression) return;
+  const contents = (rendition.getContents() || [])[0];
+  const range = contents && rangeAt(contents.document, record.progression);
+  if (range) await rendition.display(contents.cfiFromRange(range));
+}
+
+function offerJump(record) {
+  const status = $('reader-status');
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'quiet';
+  const device = (record.device_id || 'another device').replace(/-[^-]*$/, '');
+  button.textContent = `Go to ${Math.floor(record.percent)}% (read on ${device})`;
+  button.addEventListener('click', async () => {
+    status.replaceChildren();
+    const session = readerSession;
+    restoring = true;
+    try { await goToRecord(record, session); } finally { if (session === readerSession) restoring = false; }
+    lastSavedAt = Math.max(lastSavedAt, record.updated_at);
+  });
+  status.replaceChildren(button);
+}
+
+// Like Play Books: when you come back to this tab, check whether you read further elsewhere.
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'hidden') { flushProgress(); return; }
+  if (!openBook || restoring) return;
+  const book = openBook;
+  try {
+    const record = await getSync(book.id);
+    if (record && openBook === book && record.updated_at > lastSavedAt && record.device_id !== deviceId()) offerJump(record);
+  } catch (error) { /* keep reading offline */ }
+});
 
 async function readBook(book) {
   clearCovers();
@@ -257,8 +396,8 @@ async function readBook(book) {
     // Finish a pending save before reopening a book in the same browser.
     await progressQueue;
     if (session !== readerSession) return;
-    const [response, progress] = await Promise.all([
-      api(`/api/books/${encodeURIComponent(book.id)}/file`), getProgress(book.id)
+    const [response, record] = await Promise.all([
+      api(`/api/v1/books/${encodeURIComponent(book.id)}/download`), getSync(book.id)
     ]);
     const bytes = await response.arrayBuffer();
     if (session !== readerSession) return;
@@ -272,11 +411,17 @@ async function readBook(book) {
       const displayed = start.displayed || {};
       const chapter = Number.isInteger(start.index) ? `Chapter ${start.index + 1}` : '';
       const page = displayed.page && displayed.total ? ` · ${displayed.page} / ${displayed.total}` : '';
-      $('position').textContent = chapter + page;
+      const fraction = displayed.total > 1 ? (displayed.page - 1) / (displayed.total - 1) : 0;
+      const percent = Number.isInteger(start.index) ? ` · ${Math.floor(bookPercent(start.index, fraction))}%` : '';
+      $('position').textContent = chapter + page + percent;
       queueProgress(location);
     });
     applyReaderSettings();
-    await restoreProgress(progress, session);
+    measureChapters(epubBook, session);
+    if (record) {
+      lastSavedAt = record.updated_at;
+      await goToRecord(record, session);
+    } else await restoreLegacy(await getLegacyProgress(book.id), session);
     if (session !== readerSession) return;
     restoring = false;
     $('reader-status').textContent = '';
@@ -309,7 +454,9 @@ $('login-form').addEventListener('submit', (event) => {
   event.preventDefault();
   token = $('token').value.trim();
   if (!token) return;
+  userId = $('user-id').value.trim() || 'default';
   localStorage.setItem(tokenKey, token);
+  localStorage.setItem(userKey, userId);
   $('token').value = '';
   $('login-error').textContent = '';
   show('library');
@@ -330,5 +477,6 @@ $('next').addEventListener('click', () => turnPage('next'));
 $('font-size').addEventListener('change', applyReaderSettings);
 $('theme').addEventListener('change', applyReaderSettings);
 
+$('user-id').value = userId === 'default' ? '' : userId;
 if (token) { show('library'); loadLibrary(); }
 else show('login');
